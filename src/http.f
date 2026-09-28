@@ -422,6 +422,11 @@ fn(http_listen(app)) {
     worker_mode := http_config_value(config, "worker_mode", "oneshot")
     worker_pool_size := http_config_value(config, "worker_pool_size", max_concurrency)
     worker_max_requests := http_config_value(config, "worker_max_requests", 1000)
+    shutdown_grace_ms := http_config_value(config, "shutdown_grace_ms", 5000)
+    admission_timeout_ms := http_config_value(config, "admission_timeout_ms", 20)
+    status_path := http_config_value(config, "status_path", "")
+    event_log_path := http_config_value(config, "event_log_path", "")
+    max_event_log_bytes := http_config_value(config, "max_event_log_bytes", 1048576)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -454,6 +459,11 @@ fn(http_listen(app)) {
         "--worker-mode", worker_mode,
         "--worker-pool-size", worker_pool_size.to_string(),
         "--worker-max-requests", worker_max_requests.to_string(),
+        "--shutdown-grace-ms", shutdown_grace_ms.to_string(),
+        "--admission-timeout-ms", admission_timeout_ms.to_string(),
+        "--status-path", status_path,
+        "--event-log-path", event_log_path,
+        "--max-event-log-bytes", max_event_log_bytes.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {

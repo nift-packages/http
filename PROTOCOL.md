@@ -144,6 +144,17 @@ response send and cleanup. The helper allocates no unbounded executor queue.
 When all slots remain occupied after a short admission grace period, an accepted
 connection receives an empty 503 without a request directory or worker launch.
 Finite `max_requests` still counts accepted connections, including overloads.
+`admission_timeout_ms` configures the bounded admission wait. The coordinator
+does not allocate one queued thread per waiting client; additional connections
+remain bounded by the kernel listen backlog.
+
+The first termination signal closes the listener and enters graceful drain.
+Active request sockets/workers remain valid until completion or the finite
+`shutdown_grace_ms` deadline. Deadline expiry, parent death or a second signal
+closes active sockets, terminates all registered worker groups and then removes
+request directories. The optional atomic status snapshot exposes `starting`,
+`ready`, `draining`, `aborting` and `stopped` phases. Optional NDJSON events are
+size-bounded and remain separate from HTTP and worker framing.
 
 Persistent workers reuse the same protocol-1 request/response envelopes and
 request IDs as one-shot workers. Binary bodies and uploads remain in private

@@ -176,6 +176,28 @@ application state. Sessions, records and other shared data require synchronized
 filesystem/database/service storage. Request upload/body handles are explicitly
 expired after every dispatch even though the worker remains alive.
 
+Operational options are also finite. `admission_timeout_ms` controls how long
+one accepted connection may wait for a slot before 503 (default 20 ms).
+`shutdown_grace_ms` bounds graceful drain (default 5 seconds): the first
+SIGTERM/SIGINT stops admission and drains active requests; a second signal or
+deadline expiry closes sockets and terminates worker groups.
+
+Optional observability writes no protocol data to stdout:
+
+```nift
+app := http.server({
+    "status_path": "run/http-status.json",
+    "event_log_path": "run/http-events.ndjson",
+    "max_event_log_bytes": 1048576
+})
+```
+
+The status file is atomically replaced and reports readiness/phase, active
+requests/workers, queue depth, worker process count and accepted/admitted/
+rejected/completed/error/start/restart/recycle counters. The event file contains
+bounded NDJSON request/overload records with request and worker IDs where
+available; it truncates before exceeding `max_event_log_bytes`.
+
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
 incremental handler streams, WebSockets, FFI and native modules are
 deferred.

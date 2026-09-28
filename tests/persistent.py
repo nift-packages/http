@@ -353,7 +353,7 @@ finish_server(server, "spools")
 descendant_file = os.path.join(WORK, "persistent-descendants.txt")
 port = free_port()
 server, helper = start_server("shutdown-persistent", f'''@import("http")
-app := http.server({{"host":"127.0.0.1","port":{port},"max_concurrency":4,"worker_mode":"persistent","worker_pool_size":4,"worker_timeout_ms":30000}})
+app := http.server({{"host":"127.0.0.1","port":{port},"max_concurrency":4,"worker_mode":"persistent","worker_pool_size":4,"worker_timeout_ms":30000,"shutdown_grace_ms":500}})
 http.get(app, "/hang", (request) => {{
     run("sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! >> persistent-descendants.txt")
     while(true) {{}}

@@ -502,6 +502,7 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
         request["_body_path"] = private_body_path
     if uploads:
         request["_uploads"] = uploads
+    request_state["path"] = path
     request_path = os.path.join(request_dir, "request.json")
     with open(request_path, "w", encoding="utf-8") as output:
         json.dump(request, output, ensure_ascii=False, separators=(",", ":"))
@@ -597,10 +598,17 @@ def run_oneshot_worker(args, request, request_path, request_dir, state, request_
         )
     except OSError as exc:
         raise HttpError(500, f"worker launch failed: {exc}") from exc
-    diagnostic, drain = start_diagnostic_drain(process, f"http-worker-log-{request_id}")
-    if not state.register_worker(request_id, process):
+    state.worker_started()
+    try:
+        diagnostic, drain = start_diagnostic_drain(process, f"http-worker-log-{request_id}")
+    except OSError:
+        state.worker_finished()
+        raise
+    if not state.register_worker(request_id, process, request_id):
         terminate_process(process)
         drain.join(timeout=1)
+        process.stdout.close()
+        state.worker_finished()
         raise HttpError(500, "server is shutting down")
     try:
         process.wait(timeout=args.worker_timeout_ms / 1000.0)
@@ -612,12 +620,13 @@ def run_oneshot_worker(args, request, request_path, request_dir, state, request_
         state.unregister_worker(request_id, process)
         drain.join(timeout=1)
         process.stdout.close()
+        state.worker_finished()
     if process.returncode != 0:
         diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
         if diagnostic_text:
             print(f"http helper: worker failed: {diagnostic_text}", file=sys.stderr)
         raise HttpError(500, "application worker failed")
-    return load_worker_response(response_path, request)
+    return load_worker_response(response_path, request), str(request_id)
 
 
 class PersistentWorker:
@@ -627,6 +636,9 @@ class PersistentWorker:
         self.diagnostic = diagnostic
         self.drain = drain
         self.requests = 0
+        self.finished = False
+        self.counted = False
+        self.finish_lock = threading.Lock()
 
 
 class PersistentWorkerStartupTimeout(OSError):
@@ -634,8 +646,9 @@ class PersistentWorkerStartupTimeout(OSError):
 
 
 class PersistentWorkerPool:
-    def __init__(self, args):
+    def __init__(self, args, state):
         self.args = args
+        self.state = state
         self.condition = threading.Condition()
         self.workers = {}
         self.available = []
@@ -647,7 +660,7 @@ class PersistentWorkerPool:
     def start(self):
         try:
             for _index in range(self.args.worker_pool_size):
-                worker = self.launch_worker()
+                worker = self.launch_worker(cancel_on_drain=True)
                 with self.condition:
                     if self.stopping:
                         self.finish_worker(worker)
@@ -658,7 +671,7 @@ class PersistentWorkerPool:
             self.shutdown()
             raise
 
-    def launch_worker(self, deadline=None):
+    def launch_worker(self, deadline=None, cancel_on_drain=False):
         with self.condition:
             worker_id = self.next_worker_id
             self.next_worker_id += 1
@@ -681,9 +694,13 @@ class PersistentWorkerPool:
         if deadline is None:
             deadline = time.monotonic() + self.args.worker_timeout_ms / 1000.0
         while not os.path.exists(ready_path):
-            if self.stopping:
+            if self.stopping or (cancel_on_drain and self.state.shutdown_requested()):
                 self.finish_worker(worker)
                 raise OSError("persistent worker startup cancelled")
+            if os.getppid() != self.state.parent_pid:
+                self.state.force_requested.set()
+                self.finish_worker(worker)
+                raise OSError("server parent exited during worker startup")
             if process.poll() is not None:
                 diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
                 self.finish_worker(worker)
@@ -692,10 +709,22 @@ class PersistentWorkerPool:
                 self.finish_worker(worker)
                 raise PersistentWorkerStartupTimeout("persistent worker startup timed out")
             time.sleep(0.002)
-        os.remove(ready_path)
+        try:
+            os.remove(ready_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.finish_worker(worker)
+            raise
+        self.state.worker_started()
+        worker.counted = True
         return worker
 
     def finish_worker(self, worker, graceful=False):
+        with worker.finish_lock:
+            if worker.finished:
+                return
+            worker.finished = True
         if graceful and worker.process.stdin is not None:
             try:
                 worker.process.stdin.close()
@@ -711,6 +740,9 @@ class PersistentWorkerPool:
         worker.drain.join(timeout=1)
         if worker.process.stdout is not None:
             worker.process.stdout.close()
+        if worker.counted:
+            worker.counted = False
+            self.state.worker_finished()
 
     def acquire(self, state, deadline):
         while True:
@@ -737,6 +769,7 @@ class PersistentWorkerPool:
                         self.condition.wait(timeout=max(0, min(0.05, deadline - time.monotonic())))
                         continue
             if dead is not None:
+                self.state.increment("worker_restarts")
                 self.finish_worker(dead)
                 continue
             try:
@@ -763,7 +796,7 @@ class PersistentWorkerPool:
                 raise HttpError(500, "server is shutting down")
             return worker
 
-    def release(self, worker, replace=False):
+    def release(self, worker, replace=False, reason=None):
         if not replace and worker.process.poll() is None:
             with self.condition:
                 if not self.stopping:
@@ -773,13 +806,17 @@ class PersistentWorkerPool:
                 replace = True
         with self.condition:
             self.workers.pop(worker.worker_id, None)
-            stopping = self.stopping
+            stopping = self.stopping or self.state.aborting.is_set() or reason == "shutdown"
             if not stopping:
                 self.replacing += 1
             self.condition.notify_all()
         if stopping:
             self.finish_worker(worker, graceful=not replace)
             return
+        if reason == "recycle":
+            self.state.increment("worker_recycles")
+        else:
+            self.state.increment("worker_restarts")
         maintenance = threading.Thread(
             target=self.replace_worker,
             args=(worker, replace),
@@ -867,13 +904,7 @@ class PersistentWorkerPool:
                     worker.process.kill()
             except ProcessLookupError:
                 pass
-            try:
-                worker.process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
-            worker.drain.join(timeout=1)
-            if worker.process.stdout is not None:
-                worker.process.stdout.close()
+            self.finish_worker(worker)
         with self.condition:
             self.workers.clear()
 
@@ -888,8 +919,9 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
     deadline = time.monotonic() + args.worker_timeout_ms / 1000.0
     worker = state.pool.acquire(state, deadline)
     replace = False
-    if not state.register_worker(request_id, worker.process):
-        state.pool.release(worker, replace=True)
+    replacement_reason = None
+    if not state.register_worker(request_id, worker.process, worker.worker_id):
+        state.pool.release(worker, replace=True, reason="shutdown")
         raise HttpError(500, "server is shutting down")
     try:
         try:
@@ -897,11 +929,13 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
             worker.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             replace = True
+            replacement_reason = "failure"
             raise HttpError(500, "persistent worker control channel failed") from exc
         worker.requests += 1
         while not os.path.exists(response_path):
             if worker.process.poll() is not None:
                 replace = True
+                replacement_reason = "failure"
                 diagnostic = worker.diagnostic.decode("utf-8", "replace").strip()
                 print(
                     f"http helper: persistent worker exited {worker.process.returncode}"
@@ -911,9 +945,11 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
                 raise HttpError(500, "persistent application worker failed")
             if state.aborting.is_set():
                 replace = True
+                replacement_reason = "failure"
                 raise HttpError(500, "server is shutting down")
             if time.monotonic() >= deadline:
                 replace = True
+                replacement_reason = "failure"
                 terminate_process(worker.process)
                 raise HttpError(504, "application worker timed out")
             time.sleep(0.002)
@@ -921,13 +957,15 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
             response = load_worker_response(response_path, request)
         except HttpError:
             replace = True
+            replacement_reason = "failure"
             raise
         if worker.requests >= args.worker_max_requests:
             replace = True
-        return response
+            replacement_reason = "recycle"
+        return response, str(worker.worker_id)
     finally:
         state.unregister_worker(request_id, worker.process)
-        state.pool.release(worker, replace=replace)
+        state.pool.release(worker, replace=replace, reason=replacement_reason)
 
 
 def run_worker(args, request, request_path, request_dir, state, request_id):
@@ -1200,15 +1238,161 @@ def safe_send_response(conn, status, body, headers=(), method="GET"):
 
 
 class ServerState:
-    def __init__(self):
+    def __init__(self, parent_pid):
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
+        self.draining = threading.Event()
         self.aborting = threading.Event()
+        self.force_requested = threading.Event()
+        self.signal_count = 0
+        self.parent_pid = parent_pid
         self.server = None
         self.connections = {}
         self.workers = {}
+        self.request_worker_ids = {}
         self.threads = {}
         self.pool = None
+        self.phase = "starting"
+        self.admission_waiting = 0
+        self.worker_processes = 0
+        self.metrics = {
+            "accepted": 0, "admitted": 0, "rejected": 0, "completed": 0,
+            "errors": 0, "worker_starts": 0, "worker_restarts": 0,
+            "worker_recycles": 0,
+        }
+        self.status_path = None
+        self.event_log_path = None
+        self.max_event_log_bytes = 1048576
+        self.admission_timeout_ms = 20
+        self.mode = "oneshot"
+        self.max_concurrency = 1
+
+    def configure(self, args):
+        self.mode = args.worker_mode
+        self.max_concurrency = args.max_concurrency
+        self.status_path = self.resolve_output_path(args.status_path, args.cwd)
+        self.event_log_path = self.resolve_output_path(args.event_log_path, args.cwd)
+        self.max_event_log_bytes = args.max_event_log_bytes
+        self.admission_timeout_ms = args.admission_timeout_ms
+        if self.paths_alias(self.status_path, self.event_log_path):
+            raise OSError("status and event log paths must not alias")
+        if self.paths_alias(
+            self.status_path, self.status_path + ".tmp" if self.status_path else None,
+        ):
+            raise OSError("status path conflicts with its temporary path")
+        if self.paths_alias(self.status_path + ".tmp" if self.status_path else None, self.event_log_path):
+            raise OSError("event log conflicts with status temporary path")
+        if self.event_log_path:
+            try:
+                mode = "w" if os.path.getsize(self.event_log_path) > self.max_event_log_bytes else "a"
+            except OSError:
+                mode = "a"
+            with open(self.event_log_path, mode, encoding="utf-8"):
+                pass
+        with self.lock:
+            self.write_status_locked(strict=True)
+
+    @staticmethod
+    def resolve_output_path(path, cwd):
+        if not path:
+            return None
+        resolved = path if os.path.isabs(path) else os.path.join(cwd, path)
+        return os.path.realpath(os.path.abspath(resolved))
+
+    @staticmethod
+    def paths_alias(first, second):
+        if not first or not second:
+            return False
+        if first == second:
+            return True
+        try:
+            return os.path.samefile(first, second)
+        except OSError:
+            return False
+
+    def shutdown_requested(self):
+        return self.signal_count > 0 or self.force_requested.is_set()
+
+    def forced_shutdown_requested(self):
+        return self.signal_count > 1 or self.force_requested.is_set()
+
+    def status_value_locked(self):
+        return {
+            "protocol": 1,
+            "phase": self.phase,
+            "ready": self.phase == "ready",
+            "worker_mode": self.mode,
+            "max_concurrency": self.max_concurrency,
+            "active_requests": len(self.connections),
+            "active_workers": len(self.workers),
+            "worker_processes": self.worker_processes,
+            "queue_depth": self.admission_waiting,
+            "counters": dict(self.metrics),
+        }
+
+    def write_status_locked(self, strict=False):
+        if not self.status_path:
+            return
+        temporary = self.status_path + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as output:
+                json.dump(self.status_value_locked(), output, separators=(",", ":"))
+            os.replace(temporary, self.status_path)
+        except OSError as exc:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+            if strict:
+                raise
+            print(f"http helper: cannot write status: {exc}", file=sys.stderr)
+
+    def set_phase(self, phase):
+        with self.lock:
+            self.phase = phase
+            self.write_status_locked()
+
+    def increment(self, name, amount=1):
+        with self.lock:
+            self.metrics[name] += amount
+            self.write_status_locked()
+
+    def worker_started(self):
+        with self.lock:
+            self.metrics["worker_starts"] += 1
+            self.worker_processes += 1
+            self.write_status_locked()
+
+    def worker_finished(self):
+        with self.lock:
+            self.worker_processes -= 1
+            self.write_status_locked()
+
+    def record_event(self, event):
+        if not self.event_log_path:
+            return
+        event = {"time": round(time.time(), 6), **event}
+        encoded = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+        if len(encoded.encode("utf-8")) > self.max_event_log_bytes:
+            event = {
+                key: value for key, value in event.items()
+                if key in ("time", "event", "request_id", "worker_id", "status", "duration_ms")
+            }
+            event["truncated"] = True
+            encoded = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
+        if len(encoded.encode("utf-8")) > self.max_event_log_bytes:
+            return
+        with self.lock:
+            try:
+                size = os.path.getsize(self.event_log_path)
+            except OSError:
+                size = 0
+            mode = "w" if size + len(encoded.encode("utf-8")) > self.max_event_log_bytes else "a"
+            try:
+                with open(self.event_log_path, mode, encoding="utf-8") as output:
+                    output.write(encoded)
+            except OSError as exc:
+                print(f"http helper: cannot write event log: {exc}", file=sys.stderr)
 
     def set_server(self, server):
         with self.lock:
@@ -1218,42 +1402,69 @@ class ServerState:
         self.pool = pool
 
     def admit(self, request_id, conn):
-        deadline = time.monotonic() + 0.02
+        deadline = time.monotonic() + self.admission_timeout_ms / 1000.0
         with self.condition:
-            while not self.aborting.is_set() and len(self.connections) >= self.max_concurrency:
+            waiting = False
+            while not self.shutdown_requested() and len(self.connections) >= self.max_concurrency:
+                if not waiting:
+                    waiting = True
+                    self.admission_waiting += 1
+                    self.write_status_locked()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self.admission_waiting -= 1
+                    self.write_status_locked()
                     return False
-                self.condition.wait(remaining)
-            if self.aborting.is_set():
+                if os.getppid() != self.parent_pid:
+                    self.force_requested.set()
+                    break
+                self.condition.wait(min(0.05, remaining))
+            if waiting:
+                self.admission_waiting -= 1
+            if self.shutdown_requested() or self.draining.is_set():
+                self.write_status_locked()
                 return False
             self.connections[request_id] = conn
+            self.metrics["admitted"] += 1
+            self.write_status_locked()
             return True
 
     def register_thread(self, request_id, thread):
         with self.lock:
             self.threads[request_id] = thread
 
-    def register_worker(self, request_id, process):
+    def register_worker(self, request_id, process, worker_id):
         with self.lock:
             if self.aborting.is_set():
                 return False
             self.workers[request_id] = process
+            self.request_worker_ids[request_id] = str(worker_id)
+            self.write_status_locked()
             return True
 
     def unregister_worker(self, request_id, process):
         with self.lock:
             if self.workers.get(request_id) is process:
                 del self.workers[request_id]
+                self.write_status_locked()
 
     def complete(self, request_id):
         with self.condition:
             self.connections.pop(request_id, None)
             self.threads.pop(request_id, None)
+            self.request_worker_ids.pop(request_id, None)
+            self.metrics["completed"] += 1
+            self.write_status_locked()
             self.condition.notify_all()
+
+    def request_worker_id(self, request_id):
+        with self.lock:
+            return self.request_worker_ids.get(request_id)
 
     def abort(self):
         self.aborting.set()
+        self.set_phase("aborting")
+        self.begin_drain()
         if self.pool is not None:
             self.pool.begin_shutdown()
         with self.condition:
@@ -1268,6 +1479,19 @@ class ServerState:
         for conn in connections:
             try:
                 conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def begin_drain(self):
+        self.draining.set()
+        if not self.aborting.is_set():
+            self.set_phase("draining")
+        with self.condition:
+            server = self.server
+            self.condition.notify_all()
+        if server is not None:
+            try:
+                server.close()
             except OSError:
                 pass
 
@@ -1293,19 +1517,36 @@ class ServerState:
                 if process.poll() is None:
                     process.terminate()
 
-    def join_threads(self):
+    def join_threads(self, timeout=None, interruptible=True):
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self.lock:
                 threads = list(self.threads.values())
             if not threads:
-                return
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            if interruptible and (
+                self.forced_shutdown_requested() or os.getppid() != self.parent_pid
+            ):
+                self.force_requested.set()
+                return False
             for thread in threads:
-                thread.join(timeout=0.1)
+                if interruptible and (
+                    self.forced_shutdown_requested() or os.getppid() != self.parent_pid
+                ):
+                    self.force_requested.set()
+                    return False
+                remaining = 0.02 if deadline is None else max(0, min(0.02, deadline - time.monotonic()))
+                thread.join(timeout=remaining)
 
 
 def handle_connection(args, state, conn, address, request_id, request_dir):
-    request_state = {"method": "GET"}
+    request_state = {"method": "GET", "path": ""}
     payload = None
+    worker_id = None
+    status = 499
+    started = time.perf_counter()
     try:
         with conn:
             conn.settimeout(args.client_timeout_ms / 1000.0)
@@ -1313,29 +1554,43 @@ def handle_connection(args, state, conn, address, request_id, request_dir):
                 request, request_path = read_request(
                     conn, address, args, request_id, request_dir, request_state,
                 )
-                response = run_worker(
+                response, worker_id = run_worker(
                     args, request, request_path, request_dir, state, request_id,
                 )
                 status, headers, payload = response_parts(response, request, args)
                 conn.settimeout(args.response_timeout_ms / 1000.0)
                 safe_send_response(conn, status, payload, headers, request_state["method"])
             except socket.timeout:
+                status = 408
                 safe_send_response(conn, 408, "request timeout", method=request_state["method"])
             except HttpError as exc:
+                status = exc.status
                 safe_send_response(conn, exc.status, exc.message, method=request_state["method"])
             except (BrokenPipeError, ConnectionResetError, UnicodeEncodeError, OSError):
                 pass
             except Exception as exc:
+                status = 500
                 print(f"http helper: request failed: {exc}", file=sys.stderr)
                 safe_send_response(conn, 500, "internal server error", method=request_state["method"])
     finally:
         if isinstance(payload, dict) and payload.get("kind") == "file":
             payload["source"].close()
         shutil.rmtree(request_dir, ignore_errors=True)
+        if status >= 500:
+            state.increment("errors")
+        state.record_event({
+            "event": "request",
+            "request_id": str(request_id),
+            "worker_id": worker_id or state.request_worker_id(request_id),
+            "method": request_state["method"],
+            "path": request_state["path"],
+            "status": status,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        })
         state.complete(request_id)
 
 
-def reject_overload(conn):
+def reject_overload(state, conn, request_id):
     with conn:
         try:
             conn.settimeout(0.1)
@@ -1344,15 +1599,19 @@ def reject_overload(conn):
             )
         except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
             pass
+    state.increment("rejected")
+    state.record_event({
+        "event": "overload", "request_id": str(request_id), "status": 503,
+    })
 
 
 def serve(args):
-    state = ServerState()
-    state.max_concurrency = args.max_concurrency
     parent_pid = os.getppid()
+    state = ServerState(parent_pid)
+    state.configure(args)
 
     def stop(_signum, _frame):
-        state.abort()
+        state.signal_count += 1
 
     signal.signal(signal.SIGTERM, stop)
     if hasattr(signal, "SIGINT"):
@@ -1365,31 +1624,41 @@ def serve(args):
             if "\n" in temp_root or "\r" in temp_root:
                 raise OSError("persistent worker temporary path contains a line break")
             args.temp_root = temp_root
-            pool = PersistentWorkerPool(args)
+            pool = PersistentWorkerPool(args, state)
             state.set_pool(pool)
             pool.start()
+        if state.forced_shutdown_requested() or os.getppid() != parent_pid:
+            state.abort()
+            raise OSError("server startup cancelled")
+        if state.shutdown_requested():
+            state.begin_drain()
+            raise OSError("server startup drained")
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         state.set_server(server)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, args.port))
         server.listen(args.backlog)
         server.settimeout(0.2)
-        while not state.aborting.is_set() and (args.max_requests == 0 or handled < args.max_requests):
+        state.set_phase("ready")
+        while not state.shutdown_requested() and not state.draining.is_set() and (
+            args.max_requests == 0 or handled < args.max_requests
+        ):
             if os.getppid() != parent_pid:
-                state.abort()
+                state.force_requested.set()
                 break
             try:
                 conn, address = server.accept()
             except socket.timeout:
                 continue
             except OSError:
-                if state.aborting.is_set():
+                if state.draining.is_set():
                     break
                 raise
             handled += 1
+            state.increment("accepted")
             request_id = handled
             if not state.admit(request_id, conn):
-                reject_overload(conn)
+                reject_overload(state, conn, request_id)
                 continue
             request_dir = os.path.join(temp_root, str(handled))
             try:
@@ -1406,22 +1675,29 @@ def serve(args):
                 state.complete(request_id)
                 conn.close()
                 raise
-        if state.aborting.is_set():
+        if state.forced_shutdown_requested() or os.getppid() != parent_pid:
             state.abort()
             state.terminate_workers()
-        state.join_threads()
+        else:
+            state.begin_drain()
+            if not state.join_threads(args.shutdown_grace_ms / 1000.0):
+                state.abort()
+                state.terminate_workers()
+        state.join_threads(interruptible=False)
         if state.pool is not None:
             state.pool.shutdown()
     finally:
-        if state.aborting.is_set():
+        state.begin_drain()
+        if not state.join_threads(0):
             state.abort()
             state.terminate_workers()
-        state.join_threads()
+        state.join_threads(interruptible=False)
         if state.pool is not None:
             state.pool.shutdown()
         if server is not None:
             server.close()
         shutil.rmtree(temp_root, ignore_errors=True)
+        state.set_phase("stopped")
     return 0
 
 
@@ -1456,6 +1732,11 @@ def parse_args(argv):
     parser.add_argument("--worker-mode", choices=("oneshot", "persistent"), default="oneshot")
     parser.add_argument("--worker-pool-size", type=int, default=1)
     parser.add_argument("--worker-max-requests", type=int, default=1000)
+    parser.add_argument("--shutdown-grace-ms", type=int, default=5000)
+    parser.add_argument("--admission-timeout-ms", type=int, default=20)
+    parser.add_argument("--status-path", default="")
+    parser.add_argument("--event-log-path", default="")
+    parser.add_argument("--max-event-log-bytes", type=int, default=1048576)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
@@ -1467,7 +1748,8 @@ def parse_args(argv):
                   "max_multipart_files", "max_part_header_bytes", "max_part_headers",
                   "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
                   "max_file_response_bytes", "max_concurrency", "worker_pool_size",
-                  "worker_max_requests", "backlog"):
+                  "worker_max_requests", "shutdown_grace_ms", "admission_timeout_ms",
+                  "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
     if args.max_concurrency == 0 or args.max_concurrency > 128:
@@ -1478,6 +1760,8 @@ def parse_args(argv):
         parser.error("persistent worker-pool-size must equal max-concurrency")
     if args.worker_max_requests == 0:
         parser.error("worker-max-requests must be at least 1")
+    if args.max_event_log_bytes < 4096:
+        parser.error("max-event-log-bytes must be at least 4096")
     return args
 
 
