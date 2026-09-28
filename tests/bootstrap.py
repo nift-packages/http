@@ -68,8 +68,8 @@ else:
 stdout, stderr = process.communicate(timeout=10)
 if process.returncode != 0:
     raise SystemExit(f"FAIL app exited {process.returncode}\nstdout={stdout}\nstderr={stderr}")
-if not response.startswith(b"HTTP/1.1 501 ") or not response.endswith(b"HTTP routing is not installed yet"):
-    raise SystemExit(f"FAIL unexpected bootstrap response: {response!r}")
+if not response.startswith(b"HTTP/1.1 404 ") or not response.endswith(b"not found"):
+    raise SystemExit(f"FAIL unexpected bootstrap response: {response!r} stdout={stdout!r} stderr={stderr!r}")
 if stdout.strip().splitlines() != ["process", "process", "backend_locked", "true"]:
     raise SystemExit(f"FAIL facade contract: {stdout!r} stderr={stderr!r}")
 

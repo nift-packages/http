@@ -1,8 +1,7 @@
 # http
 
 Backend-neutral HTTP server package for Nift. Version 0.1.0 currently provides
-a process backend and a helper/worker bootstrap; routing is added in the next
-checkpoint.
+a process backend with facade-managed routing.
 
 ```nift
 @import("http")
@@ -11,6 +10,12 @@ app := http.server({
     "host": "127.0.0.1",
     "port": 8080
 })
+
+http.get(app, "/", (request) => http.text("Hello from Nift"))
+http.get(app, "/users/:id", (request) => http.json({
+    "id": request.params.id
+}))
+http.post(app, "/echo", (request) => http.text(request.body.text))
 
 result := http.listen(app)
 ```
@@ -36,7 +41,12 @@ The process helper owns HTTP parsing and serialization. A fresh Nift application
 worker owns one request. Worker stdout is not protocol framing, so application
 `print()` calls cannot corrupt responses. See [PROTOCOL.md](PROTOCOL.md).
 
+Routes support GET, POST, PUT, PATCH, DELETE and HEAD. `http.route()` accepts an
+additional method. Static segments and `:name` parameters are matched in Nift;
+HEAD falls back to a matching GET route while the helper suppresses its body.
+Request objects provide `method`, `target`, decoded `path`, `params`, `query`,
+lowercase array-valued `headers`, `body`, parsed `json` and `remote_addr`.
+
 Current scope is plain HTTP/1.0 and HTTP/1.1 with `Connection: close`. TLS,
 streaming, multipart, WebSockets, persistent workers, FFI and native modules are
-deferred. CP04 intentionally returns 501 from the bootstrap worker until routes
-are introduced in CP05.
+deferred.

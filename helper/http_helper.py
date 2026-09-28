@@ -227,6 +227,13 @@ def run_worker(args, request, request_path, request_dir, state):
         finally:
             state["worker"] = None
     if process.returncode != 0:
+        try:
+            with open(log_path, "rb") as source:
+                diagnostic = source.read(8192).decode("utf-8", "replace").strip()
+            if diagnostic:
+                print(f"http helper: worker failed: {diagnostic}", file=sys.stderr)
+        except OSError:
+            pass
         raise HttpError(500, "application worker failed")
     try:
         with open(response_path, encoding="utf-8") as source:
