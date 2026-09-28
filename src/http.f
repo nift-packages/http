@@ -164,14 +164,31 @@ fn(http_text_response(body, option_values)) {
     options := http_options(option_values)
     status := 200
     if(options.has("status")) { status = options.status }
-    return {"status":status,"headers":http_response_headers("text", options),"body":{"kind":"text","text":body}}
+    response := {"status":status,"headers":http_response_headers("text", options),"body":{"kind":"text","text":body}}
+    if(options.has("cookies")) { response["cookies"] = options.cookies }
+    return response
 }
 
 fn(http_json_response(value, option_values)) {
     options := http_options(option_values)
     status := 200
     if(options.has("status")) { status = options.status }
-    return {"status":status,"headers":http_response_headers("json", options),"body":{"kind":"json","value":value}}
+    response := {"status":status,"headers":http_response_headers("json", options),"body":{"kind":"json","value":value}}
+    if(options.has("cookies")) { response["cookies"] = options.cookies }
+    return response
+}
+
+fn(http_cookie(cookie_name, cookie_value, option_values)) {
+    options := http_options(option_values)
+    cookie := {"name":cookie_name,"value":cookie_value}
+    if(options.has("path")) { cookie["path"] = options.path }
+    if(options.has("domain")) { cookie["domain"] = options.domain }
+    if(options.has("max_age")) { cookie["max_age"] = options.max_age }
+    if(options.has("expires")) { cookie["expires"] = options.expires }
+    if(options.has("secure")) { cookie["secure"] = options.secure }
+    if(options.has("http_only")) { cookie["http_only"] = options.http_only }
+    if(options.has("same_site")) { cookie["same_site"] = options.same_site }
+    return cookie
 }
 
 fn(http_dispatch(app, request)) {
@@ -231,6 +248,7 @@ fn(http_write_worker_response(app)) {
         "headers":response.headers,
         "body":response.body
     }
+    if(response.has("cookies")) { envelope["cookies"] = response.cookies }
     output := ofstream(getenv("NIFT_HTTP_RESPONSE"))
     output.write_val(envelope)
     close(output)
@@ -268,6 +286,10 @@ fn(http_listen(app)) {
     max_header_bytes := http_config_value(config, "max_header_bytes", 32768)
     max_headers := http_config_value(config, "max_headers", 100)
     max_body_bytes := http_config_value(config, "max_body_bytes", 1048576)
+    max_form_fields := http_config_value(config, "max_form_fields", 256)
+    max_form_name_bytes := http_config_value(config, "max_form_name_bytes", 256)
+    max_form_value_bytes := http_config_value(config, "max_form_value_bytes", 65536)
+    max_cookie_pairs := http_config_value(config, "max_cookie_pairs", 128)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -283,6 +305,10 @@ fn(http_listen(app)) {
         "--max-header-bytes", max_header_bytes.to_string(),
         "--max-headers", max_headers.to_string(),
         "--max-body-bytes", max_body_bytes.to_string(),
+        "--max-form-fields", max_form_fields.to_string(),
+        "--max-form-name-bytes", max_form_name_bytes.to_string(),
+        "--max-form-value-bytes", max_form_value_bytes.to_string(),
+        "--max-cookie-pairs", max_cookie_pairs.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {
@@ -307,6 +333,8 @@ fn(http_server_backend(app)) {
     capabilities := () => { return {
         "buffered_text":true,
         "json":true,
+        "forms":true,
+        "cookies":true,
         "binary_files":false,
         "streaming":false,
         "websockets":false,
@@ -324,6 +352,7 @@ fn(http_server_backend(app)) {
     head := (app, path, handler) => http_add_route(app, "HEAD", path, handler)
     text := (body, ...options) => http_text_response(body, options)
     json := (value, ...options) => http_json_response(value, options)
+    cookie := (cookie_name, cookie_value, ...options) => http_cookie(cookie_name, cookie_value, options)
     listen := (app) => http_listen(app)
 }
 

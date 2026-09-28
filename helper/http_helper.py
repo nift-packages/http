@@ -2,6 +2,8 @@
 """Strict, dependency-free HTTP/1.x helper for the Nift http package."""
 
 import argparse
+from email.message import Message
+from email.utils import format_datetime, parsedate_to_datetime
 import json
 import os
 import re
@@ -55,6 +57,148 @@ def strict_unquote(value):
         return output.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise HttpError(400, "request target is not UTF-8") from exc
+
+
+def parse_content_type(values):
+    if not values:
+        return "", {}
+    if len(values) != 1:
+        raise HttpError(400, "duplicate content-type is not accepted")
+    message = Message()
+    message["content-type"] = values[0]
+    media_type = message.get_content_type().lower()
+    parameters = {}
+    for key, value in message.get_params()[1:]:
+        key = key.lower()
+        if key in parameters or value is None:
+            raise HttpError(400, "invalid content-type parameters")
+        parameters[key] = value
+    return media_type, parameters
+
+
+def add_repeated(mapping, key, value):
+    if key in mapping:
+        if not isinstance(mapping[key], list):
+            mapping[key] = [mapping[key]]
+        mapping[key].append(value)
+    else:
+        mapping[key] = value
+
+
+def parse_urlencoded(body, parameters, args):
+    charset = parameters.get("charset", "utf-8").lower()
+    if charset not in ("utf-8", "utf8"):
+        raise HttpError(415, "URL-encoded forms require UTF-8")
+    try:
+        encoded = body.decode("ascii")
+        strict_unquote(encoded.replace("+", " "))
+        pairs = parse_qsl(
+            encoded, keep_blank_values=True, strict_parsing=False,
+            encoding="utf-8", errors="strict", max_num_fields=args.max_form_fields,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HttpError(400, "malformed URL-encoded form") from exc
+    form = {}
+    for key, value in pairs:
+        if len(key.encode("utf-8")) > args.max_form_name_bytes:
+            raise HttpError(400, "form field name is too large")
+        if len(value.encode("utf-8")) > args.max_form_value_bytes:
+            raise HttpError(400, "form field value is too large")
+        add_repeated(form, key, value)
+    return form
+
+
+def parse_cookies(values, max_pairs):
+    cookies = {}
+    count = 0
+    for header in values:
+        if any(ord(char) < 32 or ord(char) == 127 for char in header):
+            raise HttpError(400, "invalid Cookie header")
+        for segment in header.split(";"):
+            segment = segment.strip()
+            if not segment or "=" not in segment:
+                raise HttpError(400, "malformed Cookie header")
+            name, value = segment.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            try:
+                encoded_name = name.encode("ascii")
+                encoded_value = value.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise HttpError(400, "Cookie header must be ASCII") from exc
+            if not TOKEN.fullmatch(encoded_name) or any(
+                byte < 0x21 or byte > 0x7E or byte in (0x22, 0x2C, 0x3B, 0x5C)
+                for byte in encoded_value
+            ):
+                raise HttpError(400, "malformed Cookie header")
+            count += 1
+            if count > max_pairs:
+                raise HttpError(400, "too many cookies")
+            add_repeated(cookies, name, value)
+    return cookies
+
+
+def serialize_cookie(cookie):
+    if not isinstance(cookie, dict):
+        raise HttpError(500, "invalid response cookie")
+    name = cookie.get("name")
+    value = cookie.get("value")
+    if not isinstance(name, str) or not isinstance(value, str):
+        raise HttpError(500, "invalid response cookie")
+    try:
+        encoded_name = name.encode("ascii")
+        encoded_value = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HttpError(500, "response cookies must be ASCII") from exc
+    if not TOKEN.fullmatch(encoded_name) or any(
+        byte < 0x21 or byte > 0x7E or byte in (0x22, 0x2C, 0x3B, 0x5C)
+        for byte in encoded_value
+    ):
+        raise HttpError(500, "invalid response cookie")
+    parts = [f"{name}={value}"]
+    for key, label in (("path", "Path"), ("domain", "Domain")):
+        attribute = cookie.get(key)
+        if attribute is not None:
+            if not isinstance(attribute, str) or not attribute or any(
+                ord(char) < 0x20 or ord(char) > 0x7E or char == ";" for char in attribute
+            ):
+                raise HttpError(500, f"invalid cookie {label}")
+            parts.append(f"{label}={attribute}")
+    if cookie.get("max_age") is not None:
+        max_age = cookie["max_age"]
+        if not isinstance(max_age, int) or isinstance(max_age, bool):
+            raise HttpError(500, "invalid cookie Max-Age")
+        parts.append(f"Max-Age={max_age}")
+    if cookie.get("expires") is not None:
+        expires = cookie["expires"]
+        if not isinstance(expires, str):
+            raise HttpError(500, "invalid cookie Expires")
+        try:
+            parsed = parsedate_to_datetime(expires)
+            if parsed.tzinfo is None:
+                raise ValueError("timezone required")
+            expires = format_datetime(parsed, usegmt=True)
+        except (TypeError, ValueError) as exc:
+            raise HttpError(500, "invalid cookie Expires") from exc
+        parts.append(f"Expires={expires}")
+    same_site = cookie.get("same_site")
+    if same_site is not None:
+        if not isinstance(same_site, str) or same_site.lower() not in ("strict", "lax", "none"):
+            raise HttpError(500, "invalid cookie SameSite")
+        parts.append(f"SameSite={same_site.title()}")
+    secure = cookie.get("secure", False)
+    http_only = cookie.get("http_only", False)
+    if not isinstance(secure, bool) or not isinstance(http_only, bool):
+        raise HttpError(500, "invalid cookie flag")
+    if secure:
+        parts.append("Secure")
+    if http_only:
+        parts.append("HttpOnly")
+    if name.startswith("__Secure-") and not secure:
+        raise HttpError(500, "__Secure- cookies require Secure")
+    if name.startswith("__Host-") and (not secure or cookie.get("path") != "/" or cookie.get("domain") is not None):
+        raise HttpError(500, "__Host- cookies require Secure, Path=/ and no Domain")
+    return "; ".join(parts)
 
 
 def set_remaining_timeout(conn, deadline):
@@ -154,25 +298,31 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
         raise HttpError(400, "invalid query encoding") from exc
     query = {}
     for key, value in query_pairs:
-        if key in query:
-            if not isinstance(query[key], list):
-                query[key] = [query[key]]
-            query[key].append(value)
-        else:
-            query[key] = value
+        add_repeated(query, key, value)
 
     body_path = os.path.join(request_dir, "request.body")
     with open(body_path, "wb") as output:
         output.write(body)
-    try:
-        body_text = body.decode("utf-8")
-        body_value = {"kind": "text", "text": body_text}
-    except UnicodeDecodeError:
-        raise HttpError(415, "binary request bodies are not implemented")
 
+    content_type, content_parameters = parse_content_type(headers.get("content-type", []))
+    form = {}
     json_value = None
-    content_type = headers.get("content-type", [""])[-1].split(";", 1)[0].strip().lower()
+    if content_type == "application/x-www-form-urlencoded":
+        form = parse_urlencoded(body, content_parameters, args)
+        try:
+            body_text = body.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise HttpError(400, "malformed URL-encoded form") from exc
+    else:
+        try:
+            body_text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HttpError(415, "binary request bodies are not implemented") from exc
+    body_value = {"kind": "text", "text": body_text}
     if content_type == "application/json" or content_type.endswith("+json"):
+        charset = content_parameters.get("charset", "utf-8").lower()
+        if charset not in ("utf-8", "utf8"):
+            raise HttpError(415, "JSON bodies require UTF-8")
         try:
             json_value = json.loads(
                 body_text,
@@ -192,6 +342,8 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
         "headers": headers,
         "body": body_value,
         "json": json_value,
+        "form": form,
+        "cookies": parse_cookies(headers.get("cookie", []), args.max_cookie_pairs),
         "remote_addr": address[0],
     }
     request_path = os.path.join(request_dir, "request.json")
@@ -313,6 +465,13 @@ def response_parts(response):
             ):
                 raise HttpError(500, "invalid application response header value")
             headers.append((key, value))
+    raw_cookies = response.get("cookies", [])
+    if not isinstance(raw_cookies, list):
+        raise HttpError(500, "invalid response cookies")
+    if raw_cookies and any(name == "set-cookie" for name, _value in headers):
+        raise HttpError(500, "structured cookies cannot be combined with raw Set-Cookie")
+    for cookie in raw_cookies:
+        headers.append(("set-cookie", serialize_cookie(cookie)))
     body = response.get("body", {"kind": "empty"})
     if not isinstance(body, dict):
         raise HttpError(500, "invalid application response body")
@@ -429,13 +588,18 @@ def parse_args(argv):
     parser.add_argument("--max-header-bytes", type=int, default=32768)
     parser.add_argument("--max-headers", type=int, default=100)
     parser.add_argument("--max-body-bytes", type=int, default=1048576)
+    parser.add_argument("--max-form-fields", type=int, default=256)
+    parser.add_argument("--max-form-name-bytes", type=int, default=256)
+    parser.add_argument("--max-form-value-bytes", type=int, default=65536)
+    parser.add_argument("--max-cookie-pairs", type=int, default=128)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
         parser.error("port must be between 0 and 65535")
     for name in ("max_requests", "worker_timeout_ms", "client_timeout_ms",
-                 "max_request_line", "max_header_bytes", "max_headers",
-                 "max_body_bytes", "backlog"):
+                  "max_request_line", "max_header_bytes", "max_headers",
+                  "max_body_bytes", "max_form_fields", "max_form_name_bytes",
+                  "max_form_value_bytes", "max_cookie_pairs", "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
     return args

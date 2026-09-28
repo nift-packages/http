@@ -65,12 +65,39 @@ return http.json({"created": true}, {
 })
 ```
 
+URL-encoded forms are parsed only for
+`application/x-www-form-urlencoded`. `request.form` contains strings for
+single fields and arrays for repeated names; blank values are retained. UTF-8
+is the only accepted form charset. Malformed escapes/encoding and configured
+field limits fail before the worker starts.
+
+`request.cookies` uses the same single-string/repeated-array convention. Cookie
+syntax is parsed conservatively and values are not percent-decoded. Response
+cookies use structured descriptors so repeated `Set-Cookie` remains separate:
+
+```nift
+return http.text("ok", {"cookies": [
+    http.cookie("theme", "dark", {
+        "path": "/",
+        "max_age": 3600,
+        "secure": true,
+        "http_only": true,
+        "same_site": "Lax"
+    })
+]})
+```
+
+Supported attributes are Path, Domain, Max-Age, Expires, Secure, HttpOnly and
+SameSite. Sessions, authentication and CSRF policy remain application concerns.
+
 Server options can lower the finite defaults for `max_request_line`,
 `max_header_bytes`, `max_headers`, `max_body_bytes`, `client_timeout_ms`,
 `worker_timeout_ms` and `backlog`. HTTP/1.1 requires exactly one Host header;
 transfer encoding and duplicate Content-Length are rejected. JSON request
 bodies are decoded by the helper into `request.json`; malformed JSON receives
 400 without invoking application code.
+Form-specific finite options are `max_form_fields`, `max_form_name_bytes` and
+`max_form_value_bytes`; `max_cookie_pairs` bounds parsed request cookies.
 
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
 streaming, multipart, WebSockets, persistent workers, FFI and native modules are

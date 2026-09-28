@@ -36,6 +36,8 @@ NIFT_HTTP_RESPONSE=<response.json>
   "headers": {"content-type": ["application/json"]},
   "body": {"kind": "text", "text": "{\"name\":\"A\"}"},
   "json": {"name": "A"},
+  "form": {},
+  "cookies": {"theme": "dark"},
   "remote_addr": "127.0.0.1"
 }
 ```
@@ -43,6 +45,10 @@ NIFT_HTTP_RESPONSE=<response.json>
 Header names are lowercase and values are arrays. Query values are strings;
 repeated keys are arrays. Path parameters are added by the Nift router rather
 than the helper.
+
+`application/x-www-form-urlencoded` populates `form`; request Cookie headers
+populate `cookies`. A single name maps to a string and repeated names map to an
+ordered array. Malformed form/cookie syntax is rejected before worker launch.
 
 `response.json` is a protocol-1 object:
 
@@ -53,6 +59,7 @@ than the helper.
   "status": 200,
   "headers": {"content-type": ["text/plain; charset=utf-8"]},
   "body": {"kind": "text", "text": "hello"}
+  "cookies": [{"name":"theme","value":"dark","path":"/"}]
 }
 ```
 
@@ -62,6 +69,10 @@ and `stream` descriptors without changing route or status/header semantics.
 Request bytes that are not UTF-8 receive 415 in CP06. A future package-owned
 binary reader can introduce the reserved `file` body kind without exposing its
 private spool path.
+
+Structured response cookies are validated and serialized by the helper into
+one `Set-Cookie` field per descriptor. Raw `set-cookie` headers and structured
+cookies cannot be combined.
 
 ## Channel ownership
 
