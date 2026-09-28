@@ -151,7 +151,9 @@ fn(http_options(options)) {
 fn(http_response_headers(kind, options)) {
     headers := {}
     if(kind == "json") { headers["content-type"] = ["application/json; charset=utf-8"] }
+    else if(kind == "file") { headers["content-type"] = ["application/octet-stream"] }
     else { headers["content-type"] = ["text/plain; charset=utf-8"] }
+    if(options.has("content_type")) { headers["content-type"] = [options.content_type] }
     if(options.has("headers") && type(options.headers) == "object") {
         for((header_name, header_value) : options.headers) {
             lower_header := header_name.to_lower()
@@ -190,6 +192,24 @@ fn(http_cookie(cookie_name, cookie_value, option_values)) {
     if(options.has("http_only")) { cookie["http_only"] = options.http_only }
     if(options.has("same_site")) { cookie["same_site"] = options.same_site }
     return cookie
+}
+
+fn(http_file_response(path, option_values)) {
+    options := http_options(option_values)
+    status := 200
+    if(options.has("status")) { status = options.status }
+    body := {"kind":"file","path":path}
+    if(options.has("download_name")) { body["download_name"] = options.download_name }
+    return {"status":status,"headers":http_response_headers("file", options),"body":body}
+}
+
+fn(http_root_file_response(root, path, option_values)) {
+    options := http_options(option_values)
+    status := 200
+    if(options.has("status")) { status = options.status }
+    body := {"kind":"root_file","root":root,"path":path}
+    if(options.has("download_name")) { body["download_name"] = options.download_name }
+    return {"status":status,"headers":http_response_headers("file", options),"body":body}
 }
 
 fn(http_dispatch(app, request)) {
@@ -341,6 +361,7 @@ fn(http_listen(app)) {
     max_requests := http_config_value(config, "max_requests", 0)
     worker_timeout := http_config_value(config, "worker_timeout_ms", 30000)
     client_timeout := http_config_value(config, "client_timeout_ms", 10000)
+    response_timeout := http_config_value(config, "response_timeout_ms", 30000)
     max_request_line := http_config_value(config, "max_request_line", 8192)
     max_header_bytes := http_config_value(config, "max_header_bytes", 32768)
     max_headers := http_config_value(config, "max_headers", 100)
@@ -356,6 +377,7 @@ fn(http_listen(app)) {
     max_file_bytes := http_config_value(config, "max_file_bytes", 1048576)
     max_filename_bytes := http_config_value(config, "max_filename_bytes", 255)
     max_temp_bytes := http_config_value(config, "max_temp_bytes", 2097152)
+    max_file_response_bytes := http_config_value(config, "max_file_response_bytes", 67108864)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -367,6 +389,7 @@ fn(http_listen(app)) {
         "--max-requests", max_requests.to_string(),
         "--worker-timeout-ms", worker_timeout.to_string(),
         "--client-timeout-ms", client_timeout.to_string(),
+        "--response-timeout-ms", response_timeout.to_string(),
         "--max-request-line", max_request_line.to_string(),
         "--max-header-bytes", max_header_bytes.to_string(),
         "--max-headers", max_headers.to_string(),
@@ -382,6 +405,7 @@ fn(http_listen(app)) {
         "--max-file-bytes", max_file_bytes.to_string(),
         "--max-filename-bytes", max_filename_bytes.to_string(),
         "--max-temp-bytes", max_temp_bytes.to_string(),
+        "--max-file-response-bytes", max_file_response_bytes.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {
@@ -408,7 +432,7 @@ fn(http_server_backend(app)) {
         "json":true,
         "forms":true,
         "cookies":true,
-        "binary_files":false,
+        "binary_files":true,
         "spooled_bodies":true,
         "uploads":true,
         "multipart":true,
@@ -431,6 +455,8 @@ fn(http_server_backend(app)) {
     cookie := (cookie_name, cookie_value, ...options) => http_cookie(cookie_name, cookie_value, options)
     save_upload := (upload, destination) => http_save_upload(upload, destination)
     save_body := (body, destination) => http_save_body(body, destination)
+    file := (path, ...options) => http_file_response(path, options)
+    file_from := (root, path, ...options) => http_root_file_response(root, path, options)
     listen := (app) => http_listen(app)
 }
 

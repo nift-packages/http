@@ -124,6 +124,23 @@ remains authoritative. The current helper parser is bounded but internally
 buffers the aggregate body before creating per-file spools; the public API does
 not depend on that implementation and remains compatible with later streaming.
 
+File responses are helper-streamed and never loaded into a Nift string:
+
+```nift
+return http.file("data/report.pdf", {
+    "content_type": "application/pdf",
+    "download_name": "report.pdf"
+})
+```
+
+`http.file()` uses an application-authorized path. Do not pass untrusted route
+input to it. `http.file_from(root, relative)` is the untrusted relative-path
+facility: it rejects absolute/empty/dot/backslash components and, on POSIX,
+opens each component without following symlinks. Single byte ranges produce
+206/416 with generated Content-Range/Length and HEAD parity. Multiple ranges
+are deliberately unsupported. `max_file_response_bytes` and
+`response_timeout_ms` are finite server options.
+
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
-streaming, multipart, WebSockets, persistent workers, FFI and native modules are
+incremental handler streams, WebSockets, persistent workers, FFI and native modules are
 deferred.

@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,12 +25,13 @@ HOP_BY_HOP = {
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
 }
 REASONS = {
-    200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request",
+    200: "OK", 201: "Created", 204: "No Content", 206: "Partial Content",
+    400: "Bad Request",
     404: "Not Found", 414: "URI Too Long", 415: "Unsupported Media Type",
     405: "Method Not Allowed", 408: "Request Timeout",
     413: "Payload Too Large", 431: "Request Header Fields Too Large",
     500: "Internal Server Error", 501: "Not Implemented",
-    504: "Gateway Timeout",
+    504: "Gateway Timeout", 416: "Range Not Satisfiable",
 }
 
 
@@ -588,7 +590,128 @@ def run_worker(args, request, request_path, request_dir, state):
     return response
 
 
-def response_parts(response):
+def open_root_file(root, relative, cwd):
+    if not isinstance(root, str) or not isinstance(relative, str) or not root or not relative:
+        raise HttpError(500, "invalid rooted file response")
+    if os.path.isabs(relative) or "\\" in relative or "\x00" in relative:
+        raise HttpError(404, "file not found")
+    components = relative.split("/")
+    if any(component in ("", ".", "..") for component in components):
+        raise HttpError(404, "file not found")
+    root_path = root if os.path.isabs(root) else os.path.join(cwd, root)
+    if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptors = []
+        final_fd = None
+        try:
+            current = os.open(root_path, directory_flags)
+            descriptors.append(current)
+            for component in components[:-1]:
+                current = os.open(component, directory_flags, dir_fd=current)
+                descriptors.append(current)
+            final_fd = os.open(components[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+            metadata = os.fstat(final_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HttpError(404, "file not found")
+            source = os.fdopen(final_fd, "rb")
+            final_fd = None
+            return source, metadata.st_size
+        except (OSError, ValueError) as exc:
+            raise HttpError(404, "file not found") from exc
+        finally:
+            if final_fd is not None:
+                os.close(final_fd)
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+    root_real = os.path.realpath(root_path)
+    candidate = os.path.realpath(os.path.join(root_real, *components))
+    source = None
+    try:
+        if os.path.commonpath((root_real, candidate)) != root_real:
+            raise HttpError(404, "file not found")
+        source = open(candidate, "rb")
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HttpError(404, "file not found")
+        return source, metadata.st_size
+    except HttpError:
+        if source is not None:
+            source.close()
+        raise
+    except (OSError, ValueError) as exc:
+        if source is not None:
+            source.close()
+        raise HttpError(404, "file not found") from exc
+
+
+def open_response_file(body, args):
+    kind = body.get("kind")
+    if kind == "file":
+        path = body.get("path")
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise HttpError(500, "invalid file response path")
+        resolved = path if os.path.isabs(path) else os.path.join(args.cwd, path)
+        source = None
+        try:
+            source = open(resolved, "rb")
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HttpError(404, "file not found")
+            size = metadata.st_size
+        except HttpError:
+            if source is not None:
+                source.close()
+            raise
+        except OSError as exc:
+            if source is not None:
+                source.close()
+            raise HttpError(404, "file not found") from exc
+    elif kind == "root_file":
+        source, size = open_root_file(body.get("root"), body.get("path"), args.cwd)
+    else:
+        raise HttpError(500, "unsupported file response body kind")
+    if size > args.max_file_response_bytes:
+        source.close()
+        raise HttpError(500, "file response exceeds configured limit")
+    return source, size
+
+
+def parse_range(value, size):
+    if not isinstance(value, str) or len(value) > 256 or not value.startswith("bytes="):
+        return None
+    specification = value[6:]
+    if "," in specification or specification.count("-") != 1:
+        return None
+    start_text, end_text = specification.split("-", 1)
+    if len(start_text) > 20 or len(end_text) > 20:
+        return None
+    if start_text:
+        if not start_text.isascii() or not start_text.isdigit():
+            return None
+        start = int(start_text)
+        if end_text:
+            if not end_text.isascii() or not end_text.isdigit():
+                return None
+            end = int(end_text)
+            if end < start:
+                return None
+        else:
+            end = size - 1
+        if start >= size:
+            return None
+        end = min(end, size - 1)
+    else:
+        if not end_text or not end_text.isascii() or not end_text.isdigit():
+            return None
+        suffix = int(end_text)
+        if suffix <= 0 or size == 0:
+            return None
+        start = max(0, size - suffix)
+        end = size - 1
+    return start, end
+
+
+def response_parts(response, request=None, args=None):
     status = response.get("status")
     if not isinstance(status, int) or isinstance(status, bool) or status < 200 or status > 599:
         raise HttpError(500, "invalid application response status")
@@ -641,14 +764,50 @@ def response_parts(response):
             ).encode("utf-8")
         except (TypeError, ValueError) as exc:
             raise HttpError(500, "invalid JSON response body") from exc
+    elif kind in ("file", "root_file"):
+        if any(name in ("content-length", "content-range", "accept-ranges") for name, _value in headers):
+            raise HttpError(500, "application supplied reserved file response headers")
+        source, size = open_response_file(body, args)
+        download_name = body.get("download_name")
+        if download_name is not None:
+            if not isinstance(download_name, str) or not download_name or any(
+                ord(char) < 0x20 or ord(char) > 0x7E or char in ('"', "\\", "/")
+                for char in download_name
+            ):
+                source.close()
+                raise HttpError(500, "invalid download filename")
+            headers.append(("content-disposition", f'attachment; filename="{download_name}"'))
+        headers.append(("accept-ranges", "bytes"))
+        offset = 0
+        length = size
+        range_values = request["headers"].get("range", [])
+        if range_values and request["method"] in ("GET", "HEAD") and status == 200:
+            selected = parse_range(range_values[0], size) if len(range_values) == 1 else None
+            if selected is None:
+                source.close()
+                headers.append(("content-range", f"bytes */{size}"))
+                return 416, headers, {"kind": "bytes", "data": b""}
+            offset, end = selected
+            length = end - offset + 1
+            status = 206
+            headers.append(("content-range", f"bytes {offset}-{end}/{size}"))
+        return status, headers, {
+            "kind": "file", "source": source, "offset": offset, "length": length,
+        }
     else:
         raise HttpError(500, "unsupported application response body kind")
-    return status, headers, payload
+    return status, headers, {"kind": "bytes", "data": payload}
 
 
 def send_response(conn, status, body, headers=(), method="GET"):
     reason = REASONS.get(status, "Response")
-    payload = body.encode("utf-8") if isinstance(body, str) else body
+    if isinstance(body, str):
+        body = {"kind": "bytes", "data": body.encode("utf-8")}
+    elif isinstance(body, bytes):
+        body = {"kind": "bytes", "data": body}
+    if not isinstance(body, dict) or body.get("kind") not in ("bytes", "file"):
+        raise HttpError(500, "invalid response body plan")
+    length = len(body["data"]) if body["kind"] == "bytes" else body["length"]
     lines = [f"HTTP/1.1 {status} {reason}\r\n"]
     seen_type = False
     for name, value in headers:
@@ -659,17 +818,39 @@ def send_response(conn, status, body, headers=(), method="GET"):
         lines.append("Content-Type: text/plain; charset=utf-8\r\n")
     no_body_status = status in (204, 304)
     if not no_body_status:
-        lines.append(f"Content-Length: {len(payload)}\r\n")
+        lines.append(f"Content-Length: {length}\r\n")
     lines.append("Connection: close\r\n\r\n")
-    wire_body = b"" if method == "HEAD" or no_body_status else payload
-    conn.sendall("".join(lines).encode("latin-1") + wire_body)
+    conn.sendall("".join(lines).encode("latin-1"))
+    if method == "HEAD" or no_body_status:
+        return
+    if body["kind"] == "bytes":
+        conn.sendall(body["data"])
+        return
+    source = body["source"]
+    source.seek(body["offset"])
+    remaining = body["length"]
+    if remaining == 0:
+        return
+    try:
+        conn.sendfile(source, offset=body["offset"], count=remaining)
+    except (AttributeError, NotImplementedError):
+        source.seek(body["offset"])
+        while remaining > 0:
+            chunk = source.read(min(65536, remaining))
+            if not chunk:
+                raise OSError("file response ended before its advertised length")
+            conn.sendall(chunk)
+            remaining -= len(chunk)
 
 
 def safe_send_response(conn, status, body, headers=(), method="GET"):
     try:
         send_response(conn, status, body, headers, method)
-    except (BrokenPipeError, ConnectionResetError, socket.timeout, UnicodeEncodeError):
+    except (BrokenPipeError, ConnectionResetError, socket.timeout, UnicodeEncodeError, OSError):
         pass
+    finally:
+        if isinstance(body, dict) and body.get("kind") == "file":
+            body["source"].close()
 
 
 def serve(args):
@@ -708,7 +889,8 @@ def serve(args):
                 try:
                     request, request_path = read_request(conn, address, args, handled, request_dir, request_state)
                     response = run_worker(args, request, request_path, request_dir, state)
-                    status, headers, payload = response_parts(response)
+                    status, headers, payload = response_parts(response, request, args)
+                    conn.settimeout(args.response_timeout_ms / 1000.0)
                     safe_send_response(conn, status, payload, headers, request_state["method"])
                 except socket.timeout:
                     safe_send_response(conn, 408, "request timeout", method=request_state["method"])
@@ -736,6 +918,7 @@ def parse_args(argv):
     parser.add_argument("--max-requests", type=int, default=0)
     parser.add_argument("--worker-timeout-ms", type=int, default=30000)
     parser.add_argument("--client-timeout-ms", type=int, default=10000)
+    parser.add_argument("--response-timeout-ms", type=int, default=30000)
     parser.add_argument("--max-request-line", type=int, default=8192)
     parser.add_argument("--max-header-bytes", type=int, default=32768)
     parser.add_argument("--max-headers", type=int, default=100)
@@ -751,16 +934,18 @@ def parse_args(argv):
     parser.add_argument("--max-file-bytes", type=int, default=1048576)
     parser.add_argument("--max-filename-bytes", type=int, default=255)
     parser.add_argument("--max-temp-bytes", type=int, default=2097152)
+    parser.add_argument("--max-file-response-bytes", type=int, default=67108864)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
         parser.error("port must be between 0 and 65535")
-    for name in ("max_requests", "worker_timeout_ms", "client_timeout_ms",
+    for name in ("max_requests", "worker_timeout_ms", "client_timeout_ms", "response_timeout_ms",
                   "max_request_line", "max_header_bytes", "max_headers",
                   "max_body_bytes", "max_form_fields", "max_form_name_bytes",
                   "max_form_value_bytes", "max_cookie_pairs", "max_multipart_parts",
                   "max_multipart_files", "max_part_header_bytes", "max_part_headers",
-                  "max_file_bytes", "max_filename_bytes", "max_temp_bytes", "backlog"):
+                  "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
+                  "max_file_response_bytes", "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
     return args

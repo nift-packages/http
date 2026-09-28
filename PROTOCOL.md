@@ -58,17 +58,16 @@ ordered array. Malformed form/cookie syntax is rejected before worker launch.
   "request_id": "1",
   "status": 200,
   "headers": {"content-type": ["text/plain; charset=utf-8"]},
-  "body": {"kind": "text", "text": "hello"}
+  "body": {"kind": "text", "text": "hello"},
   "cookies": [{"name":"theme","value":"dark","path":"/"}]
 }
 ```
 
-The initial implementation supports `text`, `json` and `empty` response body
-kinds. The envelope deliberately leaves room for later package-owned `file`
-and `stream` descriptors without changing route or status/header semantics.
-Request bytes that are not UTF-8 receive 415 in CP06. A future package-owned
-binary reader can introduce the reserved `file` body kind without exposing its
-private spool path.
+The implementation supports `text`, `json`, `empty`, `file` and `root_file`
+response body kinds. The envelope deliberately leaves room for later stream
+descriptors without changing route or status/header semantics. Arbitrary binary
+request bodies use an opaque package-owned spool rather than exposing its
+private path or requiring bytes to be UTF-8.
 
 Structured response cookies are validated and serialized by the helper into
 one `Set-Cookie` field per descriptor. Raw `set-cookie` headers and structured
@@ -95,6 +94,13 @@ worker and is consumed through `http.save_upload()`. Generic binary request
 bodies similarly become a `spooled` body consumed by `http.save_body()`.
 Request cleanup always owns the original spool; saving copies it to the explicit
 application destination.
+
+File responses use either an application-authorized `file` path or a
+`root_file` pair of explicit root plus untrusted relative path. The helper opens
+and validates one regular file descriptor, derives framing/range metadata from
+that descriptor and transfers it in file chunks/`sendfile` where available.
+The worker never reads file bytes. Range support is one `bytes` range only;
+invalid, unsatisfiable and multiple ranges return 416.
 
 ## Channel ownership
 
@@ -124,6 +130,6 @@ new process group; shutdown and timeout terminate the group before cleanup.
 Windows uses a new process group but does not yet have Job Object coverage, so
 Windows support remains unverified.
 
-This protocol is one-shot in CP04-CP06. A future persistent worker can reuse the
+This protocol is one-shot in v0.1. A future persistent worker can reuse the
 same request/response envelope and request IDs over a separate control channel;
 that is deliberately deferred.
