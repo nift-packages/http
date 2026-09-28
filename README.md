@@ -141,6 +141,14 @@ opens each component without following symlinks. Single byte ranges produce
 are deliberately unsupported. `max_file_response_bytes` and
 `response_timeout_ms` are finite server options.
 
+`max_concurrency` bounds the complete active connection lifecycle and defaults
+to 1. Independent accepted requests run in fresh Nift workers concurrently up
+to that limit. When all slots remain occupied, the helper returns an empty 503
+after a short admission grace period; it does not create a request directory or
+an unbounded queued thread. One-shot workers still reconstruct top-level state,
+and application persistence must provide its own synchronization when
+concurrency is greater than 1.
+
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
 incremental handler streams, WebSockets, persistent workers, FFI and native modules are
 deferred.

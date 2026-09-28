@@ -378,6 +378,7 @@ fn(http_listen(app)) {
     max_filename_bytes := http_config_value(config, "max_filename_bytes", 255)
     max_temp_bytes := http_config_value(config, "max_temp_bytes", 2097152)
     max_file_response_bytes := http_config_value(config, "max_file_response_bytes", 67108864)
+    max_concurrency := http_config_value(config, "max_concurrency", 1)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -406,6 +407,7 @@ fn(http_listen(app)) {
         "--max-filename-bytes", max_filename_bytes.to_string(),
         "--max-temp-bytes", max_temp_bytes.to_string(),
         "--max-file-response-bytes", max_file_response_bytes.to_string(),
+        "--max-concurrency", max_concurrency.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {

@@ -1,15 +1,16 @@
 # HTTP helper protocol
 
-The process backend has two long-lived roles and one short-lived role:
+The process backend has two long-lived roles and bounded short-lived roles:
 
 ```text
-client -> Python HTTP helper -> one Nift application worker -> helper -> client
+client -> Python HTTP helper -> one fresh Nift application worker -> helper -> client
 ```
 
 The helper owns the listening socket, HTTP parsing, finite wire limits, worker
 lifetime and response serialization. The Nift application owns routes and
 application behavior. A fresh invocation of the application script handles
-each request in v0.1.0.
+each admitted request in v0.1.0. Multiple one-shot workers may run concurrently,
+but each worker still owns exactly one request.
 
 ## Exchange directory
 
@@ -104,9 +105,10 @@ invalid, unsatisfiable and multiple ranges return 416.
 
 ## Channel ownership
 
-Protocol framing never uses worker stdout or stderr. They are redirected to
-bounded-lifetime files inside the request directory and removed with that
-directory. Application `print()` output therefore cannot corrupt a response.
+Protocol framing never uses worker stdout or stderr. The helper continuously
+drains them through a private pipe, retains at most 8 KiB for failure diagnosis
+and discards excess output. Application `print()` output therefore cannot block
+or corrupt a response and cannot grow a worker log without bound.
 The helper itself is silent during normal operation; startup and fatal
 diagnostics belong to its stderr.
 
@@ -129,6 +131,12 @@ parent and exits if that parent disappears. On POSIX each worker is placed in a
 new process group; shutdown and timeout terminate the group before cleanup.
 Windows uses a new process group but does not yet have Job Object coverage, so
 Windows support remains unverified.
+
+`max_concurrency` bounds each admitted socket from request receive through
+response send and cleanup. The helper allocates no unbounded executor queue.
+When all slots remain occupied after a short admission grace period, an accepted
+connection receives an empty 503 without a request directory or worker launch.
+Finite `max_requests` still counts accepted connections, including overloads.
 
 This protocol is one-shot in v0.1. A future persistent worker can reuse the
 same request/response envelope and request IDs over a separate control channel;

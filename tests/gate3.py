@@ -19,6 +19,7 @@ if not sys.platform.startswith("linux"):
 
 NIFT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "nift")
 PKG = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else ".")
+MAX_CONCURRENCY = int(sys.argv[3]) if len(sys.argv) > 3 else 32
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, ".dogfood-work")
 shutil.rmtree(WORK, ignore_errors=True)
@@ -41,11 +42,18 @@ def free_port():
 
 
 def children(pid):
+    result = set()
     try:
-        with open(f"/proc/{pid}/task/{pid}/children", encoding="ascii") as source:
-            return [int(value) for value in source.read().split()]
+        tasks = os.listdir(f"/proc/{pid}/task")
     except OSError:
         return []
+    for task in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{task}/children", encoding="ascii") as source:
+                result.update(int(value) for value in source.read().split())
+        except OSError:
+            pass
+    return sorted(result)
 
 
 def descendants(pid):
@@ -168,12 +176,12 @@ def empty_maxima():
     }
 
 
-# Simultaneous-client probe. The handler delay keeps topology observable without
-# altering the helper's intentionally sequential dispatch.
+# Simultaneous-client probe. The handler delay keeps the bounded worker topology
+# observable. Pass an explicit limit to compare another concurrency bound.
 concurrency_port = free_port()
 with open(os.path.join(WORK, "concurrency.f"), "w", encoding="utf-8") as output:
     output.write(f'''@import("http")
-app := http.server({{"host":"127.0.0.1","port":{concurrency_port},"max_requests":42,"backlog":64}})
+app := http.server({{"host":"127.0.0.1","port":{concurrency_port},"max_requests":42,"max_concurrency":{MAX_CONCURRENCY},"backlog":64}})
 http.get(app, "/", (request) => {{
     run("sh", "-c", "sleep 0.04")
     return http.text("ok")
@@ -332,7 +340,8 @@ if cleanup_usage != (0, 0, 0):
 
 report = {
     "platform": sys.platform,
-    "architecture": "sequential helper, one fresh Nift worker per request",
+    "architecture": "bounded helper, one fresh Nift worker per request",
+    "max_concurrency": MAX_CONCURRENCY,
     "idle_rss_kib": concurrency_idle,
     "resource_idle_rss_kib": resource_idle,
     "concurrency": concurrency_results,

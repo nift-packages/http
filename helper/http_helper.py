@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import parse_qsl
 
@@ -31,7 +32,8 @@ REASONS = {
     405: "Method Not Allowed", 408: "Request Timeout",
     413: "Payload Too Large", 431: "Request Header Fields Too Large",
     500: "Internal Server Error", 501: "Not Implemented",
-    504: "Gateway Timeout", 416: "Range Not Satisfiable",
+    503: "Service Unavailable", 504: "Gateway Timeout",
+    416: "Range Not Satisfiable",
 }
 
 
@@ -541,9 +543,8 @@ def terminate_process(process):
             pass
 
 
-def run_worker(args, request, request_path, request_dir, state):
+def run_worker(args, request, request_path, request_dir, state, request_id):
     response_path = os.path.join(request_dir, "response.json")
-    log_path = os.path.join(request_dir, "worker.log")
     environment = dict(os.environ)
     environment.update({
         "NIFT_HTTP_WORKER": "1",
@@ -551,32 +552,44 @@ def run_worker(args, request, request_path, request_dir, state):
         "NIFT_HTTP_RESPONSE": response_path,
     })
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    with open(log_path, "wb") as log:
-        try:
-            process = subprocess.Popen(
-                [args.nift, args.app], cwd=args.cwd, env=environment,
-                stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=os.name == "posix", creationflags=creationflags,
-            )
-        except OSError as exc:
-            raise HttpError(500, f"worker launch failed: {exc}") from exc
-        state["worker"] = process
-        try:
-            process.wait(timeout=args.worker_timeout_ms / 1000.0)
-        except subprocess.TimeoutExpired as exc:
-            terminate_process(process)
-            raise HttpError(504, "application worker timed out") from exc
-        finally:
-            terminate_process(process)
-            state["worker"] = None
+    try:
+        process = subprocess.Popen(
+            [args.nift, args.app], cwd=args.cwd, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=os.name == "posix", creationflags=creationflags,
+        )
+    except OSError as exc:
+        raise HttpError(500, f"worker launch failed: {exc}") from exc
+    diagnostic = bytearray()
+
+    def drain_output():
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                return
+            if len(diagnostic) < 8192:
+                diagnostic.extend(chunk[:8192 - len(diagnostic)])
+
+    drain = threading.Thread(target=drain_output, name=f"http-worker-log-{request_id}")
+    drain.start()
+    if not state.register_worker(request_id, process):
+        terminate_process(process)
+        drain.join(timeout=1)
+        raise HttpError(500, "server is shutting down")
+    try:
+        process.wait(timeout=args.worker_timeout_ms / 1000.0)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process(process)
+        raise HttpError(504, "application worker timed out") from exc
+    finally:
+        terminate_process(process)
+        state.unregister_worker(request_id, process)
+        drain.join(timeout=1)
+        process.stdout.close()
     if process.returncode != 0:
-        try:
-            with open(log_path, "rb") as source:
-                diagnostic = source.read(8192).decode("utf-8", "replace").strip()
-            if diagnostic:
-                print(f"http helper: worker failed: {diagnostic}", file=sys.stderr)
-        except OSError:
-            pass
+        diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
+        if diagnostic_text:
+            print(f"http helper: worker failed: {diagnostic_text}", file=sys.stderr)
         raise HttpError(500, "application worker failed")
     try:
         with open(response_path, encoding="utf-8") as source:
@@ -853,13 +866,154 @@ def safe_send_response(conn, status, body, headers=(), method="GET"):
             body["source"].close()
 
 
+class ServerState:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.aborting = threading.Event()
+        self.server = None
+        self.connections = {}
+        self.workers = {}
+        self.threads = {}
+
+    def set_server(self, server):
+        with self.lock:
+            self.server = server
+
+    def admit(self, request_id, conn):
+        deadline = time.monotonic() + 0.02
+        with self.condition:
+            while not self.aborting.is_set() and len(self.connections) >= self.max_concurrency:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(remaining)
+            if self.aborting.is_set():
+                return False
+            self.connections[request_id] = conn
+            return True
+
+    def register_thread(self, request_id, thread):
+        with self.lock:
+            self.threads[request_id] = thread
+
+    def register_worker(self, request_id, process):
+        with self.lock:
+            if self.aborting.is_set():
+                return False
+            self.workers[request_id] = process
+            return True
+
+    def unregister_worker(self, request_id, process):
+        with self.lock:
+            if self.workers.get(request_id) is process:
+                del self.workers[request_id]
+
+    def complete(self, request_id):
+        with self.condition:
+            self.connections.pop(request_id, None)
+            self.threads.pop(request_id, None)
+            self.condition.notify_all()
+
+    def abort(self):
+        self.aborting.set()
+        with self.condition:
+            server = self.server
+            connections = list(self.connections.values())
+            self.condition.notify_all()
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
+        for conn in connections:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def terminate_workers(self):
+        with self.lock:
+            processes = list(self.workers.values())
+        if os.name == "posix":
+            for process in processes:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and any(process.poll() is None for process in processes):
+                time.sleep(0.01)
+            for process in processes:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        else:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+
+    def join_threads(self):
+        while True:
+            with self.lock:
+                threads = list(self.threads.values())
+            if not threads:
+                return
+            for thread in threads:
+                thread.join(timeout=0.1)
+
+
+def handle_connection(args, state, conn, address, request_id, request_dir):
+    request_state = {"method": "GET"}
+    payload = None
+    try:
+        with conn:
+            conn.settimeout(args.client_timeout_ms / 1000.0)
+            try:
+                request, request_path = read_request(
+                    conn, address, args, request_id, request_dir, request_state,
+                )
+                response = run_worker(
+                    args, request, request_path, request_dir, state, request_id,
+                )
+                status, headers, payload = response_parts(response, request, args)
+                conn.settimeout(args.response_timeout_ms / 1000.0)
+                safe_send_response(conn, status, payload, headers, request_state["method"])
+            except socket.timeout:
+                safe_send_response(conn, 408, "request timeout", method=request_state["method"])
+            except HttpError as exc:
+                safe_send_response(conn, exc.status, exc.message, method=request_state["method"])
+            except (BrokenPipeError, ConnectionResetError, UnicodeEncodeError, OSError):
+                pass
+            except Exception as exc:
+                print(f"http helper: request failed: {exc}", file=sys.stderr)
+                safe_send_response(conn, 500, "internal server error", method=request_state["method"])
+    finally:
+        if isinstance(payload, dict) and payload.get("kind") == "file":
+            payload["source"].close()
+        shutil.rmtree(request_dir, ignore_errors=True)
+        state.complete(request_id)
+
+
+def reject_overload(conn):
+    with conn:
+        try:
+            conn.settimeout(0.1)
+            send_response(
+                conn, 503, b"", (("retry-after", "1"),), method="HEAD",
+            )
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            pass
+
+
 def serve(args):
-    state = {"stop": False, "worker": None}
+    state = ServerState()
+    state.max_concurrency = args.max_concurrency
     parent_pid = os.getppid()
 
     def stop(_signum, _frame):
-        state["stop"] = True
-        terminate_process(state["worker"])
+        state.abort()
 
     signal.signal(signal.SIGTERM, stop)
     if hasattr(signal, "SIGINT"):
@@ -869,39 +1023,52 @@ def serve(args):
     handled = 0
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        state.set_server(server)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, args.port))
         server.listen(args.backlog)
         server.settimeout(0.2)
-        while not state["stop"] and (args.max_requests == 0 or handled < args.max_requests):
+        while not state.aborting.is_set() and (args.max_requests == 0 or handled < args.max_requests):
             if os.getppid() != parent_pid:
+                state.abort()
                 break
             try:
                 conn, address = server.accept()
             except socket.timeout:
                 continue
+            except OSError:
+                if state.aborting.is_set():
+                    break
+                raise
             handled += 1
+            request_id = handled
+            if not state.admit(request_id, conn):
+                reject_overload(conn)
+                continue
             request_dir = os.path.join(temp_root, str(handled))
-            os.mkdir(request_dir, 0o700)
-            request_state = {"method": "GET"}
-            with conn:
-                conn.settimeout(args.client_timeout_ms / 1000.0)
-                try:
-                    request, request_path = read_request(conn, address, args, handled, request_dir, request_state)
-                    response = run_worker(args, request, request_path, request_dir, state)
-                    status, headers, payload = response_parts(response, request, args)
-                    conn.settimeout(args.response_timeout_ms / 1000.0)
-                    safe_send_response(conn, status, payload, headers, request_state["method"])
-                except socket.timeout:
-                    safe_send_response(conn, 408, "request timeout", method=request_state["method"])
-                except HttpError as exc:
-                    safe_send_response(conn, exc.status, exc.message, method=request_state["method"])
-                except (BrokenPipeError, ConnectionResetError, UnicodeEncodeError):
-                    pass
-                finally:
-                    shutil.rmtree(request_dir, ignore_errors=True)
+            try:
+                os.mkdir(request_dir, 0o700)
+                thread = threading.Thread(
+                    target=handle_connection,
+                    args=(args, state, conn, address, request_id, request_dir),
+                    name=f"http-request-{request_id}",
+                )
+                state.register_thread(request_id, thread)
+                thread.start()
+            except Exception:
+                shutil.rmtree(request_dir, ignore_errors=True)
+                state.complete(request_id)
+                conn.close()
+                raise
+        if state.aborting.is_set():
+            state.abort()
+            state.terminate_workers()
+        state.join_threads()
     finally:
-        terminate_process(state["worker"])
+        if state.aborting.is_set():
+            state.abort()
+            state.terminate_workers()
+        state.join_threads()
         if server is not None:
             server.close()
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -935,6 +1102,7 @@ def parse_args(argv):
     parser.add_argument("--max-filename-bytes", type=int, default=255)
     parser.add_argument("--max-temp-bytes", type=int, default=2097152)
     parser.add_argument("--max-file-response-bytes", type=int, default=67108864)
+    parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
@@ -945,9 +1113,11 @@ def parse_args(argv):
                   "max_form_value_bytes", "max_cookie_pairs", "max_multipart_parts",
                   "max_multipart_files", "max_part_header_bytes", "max_part_headers",
                   "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
-                  "max_file_response_bytes", "backlog"):
+                  "max_file_response_bytes", "max_concurrency", "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
+    if args.max_concurrency == 0 or args.max_concurrency > 128:
+        parser.error("max-concurrency must be between 1 and 128")
     return args
 
 
