@@ -543,7 +543,44 @@ def terminate_process(process):
             pass
 
 
-def run_worker(args, request, request_path, request_dir, state, request_id):
+def start_diagnostic_drain(process, name):
+    diagnostic = bytearray()
+
+    def drain_output():
+        try:
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    return
+                if len(diagnostic) < 8192:
+                    diagnostic.extend(chunk[:8192 - len(diagnostic)])
+        except (OSError, ValueError):
+            pass
+
+    drain = threading.Thread(target=drain_output, name=name)
+    try:
+        drain.start()
+    except Exception as exc:
+        terminate_process(process)
+        process.stdout.close()
+        raise OSError(f"cannot start worker diagnostic drain: {exc}") from exc
+    return diagnostic, drain
+
+
+def load_worker_response(response_path, request):
+    try:
+        with open(response_path, encoding="utf-8") as source:
+            response = json.load(source)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HttpError(500, "application worker produced no valid response") from exc
+    if not isinstance(response, dict) or response.get("protocol") != 1:
+        raise HttpError(500, "invalid application response protocol")
+    if response.get("request_id") != request["request_id"]:
+        raise HttpError(500, "application response request ID mismatch")
+    return response
+
+
+def run_oneshot_worker(args, request, request_path, request_dir, state, request_id):
     response_path = os.path.join(request_dir, "response.json")
     environment = dict(os.environ)
     environment.update({
@@ -560,18 +597,7 @@ def run_worker(args, request, request_path, request_dir, state, request_id):
         )
     except OSError as exc:
         raise HttpError(500, f"worker launch failed: {exc}") from exc
-    diagnostic = bytearray()
-
-    def drain_output():
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                return
-            if len(diagnostic) < 8192:
-                diagnostic.extend(chunk[:8192 - len(diagnostic)])
-
-    drain = threading.Thread(target=drain_output, name=f"http-worker-log-{request_id}")
-    drain.start()
+    diagnostic, drain = start_diagnostic_drain(process, f"http-worker-log-{request_id}")
     if not state.register_worker(request_id, process):
         terminate_process(process)
         drain.join(timeout=1)
@@ -591,16 +617,323 @@ def run_worker(args, request, request_path, request_dir, state, request_id):
         if diagnostic_text:
             print(f"http helper: worker failed: {diagnostic_text}", file=sys.stderr)
         raise HttpError(500, "application worker failed")
+    return load_worker_response(response_path, request)
+
+
+class PersistentWorker:
+    def __init__(self, worker_id, process, diagnostic, drain):
+        self.worker_id = worker_id
+        self.process = process
+        self.diagnostic = diagnostic
+        self.drain = drain
+        self.requests = 0
+
+
+class PersistentWorkerStartupTimeout(OSError):
+    pass
+
+
+class PersistentWorkerPool:
+    def __init__(self, args):
+        self.args = args
+        self.condition = threading.Condition()
+        self.workers = {}
+        self.available = []
+        self.next_worker_id = 1
+        self.stopping = False
+        self.replacing = 0
+        self.maintenance_threads = set()
+
+    def start(self):
+        try:
+            for _index in range(self.args.worker_pool_size):
+                worker = self.launch_worker()
+                with self.condition:
+                    if self.stopping:
+                        self.finish_worker(worker)
+                        raise OSError("persistent pool startup cancelled")
+                    self.workers[worker.worker_id] = worker
+                    self.available.append(worker)
+        except Exception:
+            self.shutdown()
+            raise
+
+    def launch_worker(self, deadline=None):
+        with self.condition:
+            worker_id = self.next_worker_id
+            self.next_worker_id += 1
+        environment = dict(os.environ)
+        environment["NIFT_HTTP_WORKER"] = "persistent"
+        environment.pop("NIFT_HTTP_REQUEST", None)
+        environment.pop("NIFT_HTTP_RESPONSE", None)
+        ready_path = os.path.join(self.args.temp_root, f"persistent-{worker_id}.ready")
+        environment["NIFT_HTTP_READY"] = ready_path
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        process = subprocess.Popen(
+            [self.args.nift, self.args.app], cwd=self.args.cwd, env=environment,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            start_new_session=os.name == "posix", creationflags=creationflags,
+        )
+        diagnostic, drain = start_diagnostic_drain(
+            process, f"http-persistent-log-{worker_id}",
+        )
+        worker = PersistentWorker(worker_id, process, diagnostic, drain)
+        if deadline is None:
+            deadline = time.monotonic() + self.args.worker_timeout_ms / 1000.0
+        while not os.path.exists(ready_path):
+            if self.stopping:
+                self.finish_worker(worker)
+                raise OSError("persistent worker startup cancelled")
+            if process.poll() is not None:
+                diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
+                self.finish_worker(worker)
+                raise OSError(f"persistent worker exited during startup: {diagnostic_text}")
+            if time.monotonic() >= deadline:
+                self.finish_worker(worker)
+                raise PersistentWorkerStartupTimeout("persistent worker startup timed out")
+            time.sleep(0.002)
+        os.remove(ready_path)
+        return worker
+
+    def finish_worker(self, worker, graceful=False):
+        if graceful and worker.process.stdin is not None:
+            try:
+                worker.process.stdin.close()
+                worker.process.wait(timeout=0.2)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                pass
+        terminate_process(worker.process)
+        if worker.process.stdin is not None and not worker.process.stdin.closed:
+            try:
+                worker.process.stdin.close()
+            except OSError:
+                pass
+        worker.drain.join(timeout=1)
+        if worker.process.stdout is not None:
+            worker.process.stdout.close()
+
+    def acquire(self, state, deadline):
+        while True:
+            dead = None
+            launch = False
+            with self.condition:
+                if self.stopping or state.aborting.is_set():
+                    raise HttpError(500, "server is shutting down")
+                if time.monotonic() >= deadline:
+                    raise HttpError(504, "application worker timed out")
+                for candidate in self.available:
+                    if candidate.process.poll() is not None:
+                        self.available.remove(candidate)
+                        self.workers.pop(candidate.worker_id, None)
+                        dead = candidate
+                        break
+                if dead is None and len(self.workers) + self.replacing < self.args.worker_pool_size:
+                    self.replacing += 1
+                    launch = True
+                elif dead is None and self.available:
+                    return self.available.pop(0)
+                if dead is None:
+                    if not launch:
+                        self.condition.wait(timeout=max(0, min(0.05, deadline - time.monotonic())))
+                        continue
+            if dead is not None:
+                self.finish_worker(dead)
+                continue
+            try:
+                worker = self.launch_worker(deadline)
+            except PersistentWorkerStartupTimeout as exc:
+                with self.condition:
+                    self.replacing -= 1
+                    self.condition.notify_all()
+                raise HttpError(504, "application worker timed out") from exc
+            except OSError as exc:
+                with self.condition:
+                    self.replacing -= 1
+                    self.condition.notify_all()
+                raise HttpError(500, f"persistent worker launch failed: {exc}") from exc
+            with self.condition:
+                self.replacing -= 1
+                if self.stopping or state.aborting.is_set():
+                    close_worker = True
+                else:
+                    self.workers[worker.worker_id] = worker
+                    close_worker = False
+            if close_worker:
+                self.finish_worker(worker)
+                raise HttpError(500, "server is shutting down")
+            return worker
+
+    def release(self, worker, replace=False):
+        if not replace and worker.process.poll() is None:
+            with self.condition:
+                if not self.stopping:
+                    self.available.append(worker)
+                    self.condition.notify()
+                    return
+                replace = True
+        with self.condition:
+            self.workers.pop(worker.worker_id, None)
+            stopping = self.stopping
+            if not stopping:
+                self.replacing += 1
+            self.condition.notify_all()
+        if stopping:
+            self.finish_worker(worker, graceful=not replace)
+            return
+        maintenance = threading.Thread(
+            target=self.replace_worker,
+            args=(worker, replace),
+            name=f"http-worker-replace-{worker.worker_id}",
+        )
+        with self.condition:
+            self.maintenance_threads.add(maintenance)
+        try:
+            maintenance.start()
+        except Exception as exc:
+            with self.condition:
+                self.maintenance_threads.discard(maintenance)
+                self.replacing -= 1
+                self.condition.notify_all()
+            self.finish_worker(worker, graceful=not replace)
+            print(f"http helper: cannot start worker replacement: {exc}", file=sys.stderr)
+
+    def replace_worker(self, old_worker, force):
+        replacement = None
+        try:
+            self.finish_worker(old_worker, graceful=not force)
+            if not self.stopping:
+                replacement = self.launch_worker()
+            with self.condition:
+                self.replacing -= 1
+                if replacement is not None and not self.stopping:
+                    self.workers[replacement.worker_id] = replacement
+                    self.available.append(replacement)
+                    replacement = None
+                self.condition.notify_all()
+        except OSError as exc:
+            if not self.stopping:
+                print(f"http helper: persistent worker replacement failed: {exc}", file=sys.stderr)
+            with self.condition:
+                self.replacing -= 1
+                self.condition.notify_all()
+        finally:
+            if replacement is not None:
+                self.finish_worker(replacement)
+            with self.condition:
+                self.maintenance_threads.discard(threading.current_thread())
+                self.condition.notify_all()
+
+    def shutdown(self):
+        with self.condition:
+            if self.stopping and not self.workers and not self.maintenance_threads:
+                return
+            self.stopping = True
+            self.available.clear()
+            maintenance = list(self.maintenance_threads)
+            self.condition.notify_all()
+        for thread in maintenance:
+            thread.join(timeout=self.args.worker_timeout_ms / 1000.0 + 1)
+        with self.condition:
+            workers = list(self.workers.values())
+        for worker in workers:
+            if worker.process.stdin is not None:
+                try:
+                    worker.process.stdin.close()
+                except OSError:
+                    pass
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and any(
+            worker.process.poll() is None for worker in workers
+        ):
+            time.sleep(0.01)
+        for worker in workers:
+            try:
+                if os.name == "posix":
+                    os.killpg(worker.process.pid, signal.SIGTERM)
+                elif worker.process.poll() is None:
+                    worker.process.terminate()
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and any(
+            worker.process.poll() is None for worker in workers
+        ):
+            time.sleep(0.01)
+        for worker in workers:
+            try:
+                if os.name == "posix":
+                    os.killpg(worker.process.pid, signal.SIGKILL)
+                elif worker.process.poll() is None:
+                    worker.process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                worker.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            worker.drain.join(timeout=1)
+            if worker.process.stdout is not None:
+                worker.process.stdout.close()
+        with self.condition:
+            self.workers.clear()
+
+    def begin_shutdown(self):
+        with self.condition:
+            self.stopping = True
+            self.condition.notify_all()
+
+
+def run_persistent_worker(args, request, request_dir, state, request_id):
+    response_path = os.path.join(request_dir, "response.json")
+    deadline = time.monotonic() + args.worker_timeout_ms / 1000.0
+    worker = state.pool.acquire(state, deadline)
+    replace = False
+    if not state.register_worker(request_id, worker.process):
+        state.pool.release(worker, replace=True)
+        raise HttpError(500, "server is shutting down")
     try:
-        with open(response_path, encoding="utf-8") as source:
-            response = json.load(source)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HttpError(500, "application worker produced no valid response") from exc
-    if not isinstance(response, dict) or response.get("protocol") != 1:
-        raise HttpError(500, "invalid application response protocol")
-    if response.get("request_id") != request["request_id"]:
-        raise HttpError(500, "application response request ID mismatch")
-    return response
+        try:
+            worker.process.stdin.write((request_dir + "\n").encode("utf-8"))
+            worker.process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            replace = True
+            raise HttpError(500, "persistent worker control channel failed") from exc
+        worker.requests += 1
+        while not os.path.exists(response_path):
+            if worker.process.poll() is not None:
+                replace = True
+                diagnostic = worker.diagnostic.decode("utf-8", "replace").strip()
+                print(
+                    f"http helper: persistent worker exited {worker.process.returncode}"
+                    + (f": {diagnostic}" if diagnostic else ""),
+                    file=sys.stderr,
+                )
+                raise HttpError(500, "persistent application worker failed")
+            if state.aborting.is_set():
+                replace = True
+                raise HttpError(500, "server is shutting down")
+            if time.monotonic() >= deadline:
+                replace = True
+                terminate_process(worker.process)
+                raise HttpError(504, "application worker timed out")
+            time.sleep(0.002)
+        try:
+            response = load_worker_response(response_path, request)
+        except HttpError:
+            replace = True
+            raise
+        if worker.requests >= args.worker_max_requests:
+            replace = True
+        return response
+    finally:
+        state.unregister_worker(request_id, worker.process)
+        state.pool.release(worker, replace=replace)
+
+
+def run_worker(args, request, request_path, request_dir, state, request_id):
+    if args.worker_mode == "persistent":
+        return run_persistent_worker(args, request, request_dir, state, request_id)
+    return run_oneshot_worker(args, request, request_path, request_dir, state, request_id)
 
 
 def open_root_file(root, relative, cwd):
@@ -875,10 +1208,14 @@ class ServerState:
         self.connections = {}
         self.workers = {}
         self.threads = {}
+        self.pool = None
 
     def set_server(self, server):
         with self.lock:
             self.server = server
+
+    def set_pool(self, pool):
+        self.pool = pool
 
     def admit(self, request_id, conn):
         deadline = time.monotonic() + 0.02
@@ -917,6 +1254,8 @@ class ServerState:
 
     def abort(self):
         self.aborting.set()
+        if self.pool is not None:
+            self.pool.begin_shutdown()
         with self.condition:
             server = self.server
             connections = list(self.connections.values())
@@ -1022,6 +1361,13 @@ def serve(args):
     server = None
     handled = 0
     try:
+        if args.worker_mode == "persistent":
+            if "\n" in temp_root or "\r" in temp_root:
+                raise OSError("persistent worker temporary path contains a line break")
+            args.temp_root = temp_root
+            pool = PersistentWorkerPool(args)
+            state.set_pool(pool)
+            pool.start()
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         state.set_server(server)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1064,11 +1410,15 @@ def serve(args):
             state.abort()
             state.terminate_workers()
         state.join_threads()
+        if state.pool is not None:
+            state.pool.shutdown()
     finally:
         if state.aborting.is_set():
             state.abort()
             state.terminate_workers()
         state.join_threads()
+        if state.pool is not None:
+            state.pool.shutdown()
         if server is not None:
             server.close()
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -1103,6 +1453,9 @@ def parse_args(argv):
     parser.add_argument("--max-temp-bytes", type=int, default=2097152)
     parser.add_argument("--max-file-response-bytes", type=int, default=67108864)
     parser.add_argument("--max-concurrency", type=int, default=1)
+    parser.add_argument("--worker-mode", choices=("oneshot", "persistent"), default="oneshot")
+    parser.add_argument("--worker-pool-size", type=int, default=1)
+    parser.add_argument("--worker-max-requests", type=int, default=1000)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
@@ -1113,11 +1466,18 @@ def parse_args(argv):
                   "max_form_value_bytes", "max_cookie_pairs", "max_multipart_parts",
                   "max_multipart_files", "max_part_header_bytes", "max_part_headers",
                   "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
-                  "max_file_response_bytes", "max_concurrency", "backlog"):
+                  "max_file_response_bytes", "max_concurrency", "worker_pool_size",
+                  "worker_max_requests", "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
     if args.max_concurrency == 0 or args.max_concurrency > 128:
         parser.error("max-concurrency must be between 1 and 128")
+    if args.worker_pool_size == 0 or args.worker_pool_size > 128:
+        parser.error("worker-pool-size must be between 1 and 128")
+    if args.worker_mode == "persistent" and args.worker_pool_size != args.max_concurrency:
+        parser.error("persistent worker-pool-size must equal max-concurrency")
+    if args.worker_max_requests == 0:
+        parser.error("worker-max-requests must be at least 1")
     return args
 
 

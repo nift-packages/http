@@ -316,10 +316,22 @@ fn(http_save_body(body, destination)) {
     return {"ok":true,"error":"","error_code":"","backend":"process"}
 }
 
-fn(http_write_worker_response(app)) {
-    request := inject(getenv("NIFT_HTTP_REQUEST"))
+fn(http_expire_request_spools(request)) {
+    if(type(request.body) == "object" && request.body.has("_body_id") && http_spool_paths.contains(request.body._body_id)) {
+        http_spool_paths.remove(request.body._body_id)
+    }
+    for(upload : request.uploads) {
+        if(upload.has("_upload_id") && http_spool_paths.contains(upload._upload_id)) {
+            http_spool_paths.remove(upload._upload_id)
+        }
+    }
+}
+
+fn(http_worker_envelope(app, request_path)) {
+    request := inject(request_path)
     request = http_prepare_request(request)
     response := http_dispatch(app, request)
+    http_expire_request_spools(request)
     envelope := {
         "protocol":1,
         "request_id":request.request_id,
@@ -328,9 +340,36 @@ fn(http_write_worker_response(app)) {
         "body":response.body
     }
     if(response.has("cookies")) { envelope["cookies"] = response.cookies }
+    return envelope
+}
+
+fn(http_write_worker_response(app)) {
+    envelope := http_worker_envelope(app, getenv("NIFT_HTTP_REQUEST"))
     output := ofstream(getenv("NIFT_HTTP_RESPONSE"))
     output.write_val(envelope)
     close(output)
+    return {"ok":true,"error":"","error_code":"","backend":"process"}
+}
+
+fn(http_run_persistent_worker(app)) {
+    ready_path := getenv("NIFT_HTTP_READY")
+    if(ready_path != null && ready_path != "") {
+        ready := ofstream(ready_path)
+        ready.write("ready")
+        close(ready)
+    }
+    while(true) {
+        exchange := read()
+        if(exchange == null) { break }
+        request_path := exchange + "/request.json"
+        response_path := exchange + "/response.json"
+        temporary_path := exchange + "/response.tmp"
+        envelope := http_worker_envelope(app, request_path)
+        output := ofstream(temporary_path)
+        output.write_val(envelope)
+        close(output)
+        move(temporary_path, response_path)
+    }
     return {"ok":true,"error":"","error_code":"","backend":"process"}
 }
 
@@ -347,6 +386,7 @@ fn(http_listen(app)) {
         return {"ok":false,"error":"invalid http server handle","error_code":"invalid_handle","backend":null,"exit_code":null}
     }
     if(getenv("NIFT_HTTP_WORKER") == "1") { return http_write_worker_response(app) }
+    if(getenv("NIFT_HTTP_WORKER") == "persistent") { return http_run_persistent_worker(app) }
     backend := http_server_backends.get(app._server_id)
     if(backend != "process" || !http_available_now()) {
         return {"ok":false,"error":"http process backend is unavailable","error_code":"backend_unavailable","backend":backend,"exit_code":127}
@@ -379,6 +419,9 @@ fn(http_listen(app)) {
     max_temp_bytes := http_config_value(config, "max_temp_bytes", 2097152)
     max_file_response_bytes := http_config_value(config, "max_file_response_bytes", 67108864)
     max_concurrency := http_config_value(config, "max_concurrency", 1)
+    worker_mode := http_config_value(config, "worker_mode", "oneshot")
+    worker_pool_size := http_config_value(config, "worker_pool_size", max_concurrency)
+    worker_max_requests := http_config_value(config, "worker_max_requests", 1000)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -408,6 +451,9 @@ fn(http_listen(app)) {
         "--max-temp-bytes", max_temp_bytes.to_string(),
         "--max-file-response-bytes", max_file_response_bytes.to_string(),
         "--max-concurrency", max_concurrency.to_string(),
+        "--worker-mode", worker_mode,
+        "--worker-pool-size", worker_pool_size.to_string(),
+        "--worker-max-requests", worker_max_requests.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {
@@ -441,7 +487,7 @@ fn(http_server_backend(app)) {
         "streaming":false,
         "websockets":false,
         "tls":false,
-        "persistent_workers":false
+        "persistent_workers":true
     } }
     server := (config) => http_server(config)
     server_backend := (app) => http_server_backend(app)

@@ -1,16 +1,16 @@
 # HTTP helper protocol
 
-The process backend has two long-lived roles and bounded short-lived roles:
+The process backend has two long-lived server roles and bounded worker roles:
 
 ```text
-client -> Python HTTP helper -> one fresh Nift application worker -> helper -> client
+client -> Python HTTP helper -> one Nift application worker -> helper -> client
 ```
 
 The helper owns the listening socket, HTTP parsing, finite wire limits, worker
 lifetime and response serialization. The Nift application owns routes and
-application behavior. A fresh invocation of the application script handles
-each admitted request in v0.1.0. Multiple one-shot workers may run concurrently,
-but each worker still owns exactly one request.
+application behavior. One-shot mode starts a fresh application process for each
+admitted request. Persistent mode starts a fixed pool and reuses each process,
+but a worker still owns at most one request at a time.
 
 ## Exchange directory
 
@@ -22,6 +22,13 @@ NIFT_HTTP_WORKER=1
 NIFT_HTTP_REQUEST=<request.json>
 NIFT_HTTP_RESPONSE=<response.json>
 ```
+
+Persistent workers instead receive `NIFT_HTTP_WORKER=persistent` and a private
+startup-ready path. After route registration they block on newline-delimited,
+helper-generated exchange-directory paths from stdin. Each directory contains
+the same `request.json`; the worker writes `response.tmp`, closes it and renames
+it to `response.json` as the atomic completion signal. EOF requests graceful
+worker exit. Application code must not read worker stdin in persistent mode.
 
 `request.json` is a protocol-1 object:
 
@@ -138,6 +145,8 @@ When all slots remain occupied after a short admission grace period, an accepted
 connection receives an empty 503 without a request directory or worker launch.
 Finite `max_requests` still counts accepted connections, including overloads.
 
-This protocol is one-shot in v0.1. A future persistent worker can reuse the
-same request/response envelope and request IDs over a separate control channel;
-that is deliberately deferred.
+Persistent workers reuse the same protocol-1 request/response envelopes and
+request IDs as one-shot workers. Binary bodies and uploads remain in private
+spools rather than crossing the stdin control channel or JSON framing. A crash,
+timeout, invalid envelope or request-count recycle replaces that worker and
+never retries the uncertain request.

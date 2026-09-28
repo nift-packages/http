@@ -41,14 +41,15 @@ If no process backend is usable, `http.server()` returns an error object with
 `ok: false` and `error_code: "backend_unavailable"`; no server resource is
 registered. The failed first-use attempt still freezes package selection.
 
-The process helper owns HTTP parsing and serialization. A fresh Nift application
-worker owns one request. Worker stdout is not protocol framing, so application
-`print()` calls cannot corrupt responses. See [PROTOCOL.md](PROTOCOL.md).
+The process helper owns HTTP parsing and serialization. The default `oneshot`
+mode uses one fresh Nift application worker per request. Optional persistent
+workers still handle at most one request at a time. Worker stdout is not
+protocol framing, so application `print()` calls cannot corrupt responses. See
+[PROTOCOL.md](PROTOCOL.md).
 
-Because each worker reruns the application script, top-level route registration
-must be deterministic and other top-level side effects run once per request.
-Move one-time side effects outside the application script or guard them when
-`NIFT_HTTP_WORKER == "1"`. This is a central v0.1 process-backend constraint.
+In one-shot mode each request reruns the application script, so top-level route
+registration must be deterministic and other top-level side effects run once
+per request. In persistent mode top-level setup runs once per worker instead.
 
 Routes support GET, POST, PUT, PATCH, DELETE and HEAD. `http.route()` accepts an
 additional method. Static segments and `:name` parameters are matched in Nift;
@@ -149,6 +150,32 @@ an unbounded queued thread. One-shot workers still reconstruct top-level state,
 and application persistence must provide its own synchronization when
 concurrency is greater than 1.
 
+Persistent mode is explicit and uses a fixed pool:
+
+```nift
+app := http.server({
+    "host": "127.0.0.1",
+    "port": 8080,
+    "max_concurrency": 4,
+    "worker_mode": "persistent",
+    "worker_pool_size": 4,
+    "worker_max_requests": 1000
+})
+```
+
+`worker_pool_size` must equal `max_concurrency`, so an admitted request never
+waits outside its configured worker deadline. Workers register routes once,
+then handle one request at a time through private exchange files.
+Crashes, timeouts and the finite `worker_max_requests` threshold replace a
+worker without replaying its request. Worker stdin is reserved for package
+control in this mode.
+
+Mutable top-level state is strictly worker-local. With four workers, four
+simultaneous `counter += 1` requests can all return 1; it is not coherent shared
+application state. Sessions, records and other shared data require synchronized
+filesystem/database/service storage. Request upload/body handles are explicitly
+expired after every dispatch even though the worker remains alive.
+
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
-incremental handler streams, WebSockets, persistent workers, FFI and native modules are
+incremental handler streams, WebSockets, FFI and native modules are
 deferred.

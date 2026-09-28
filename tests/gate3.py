@@ -20,6 +20,9 @@ if not sys.platform.startswith("linux"):
 NIFT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "nift")
 PKG = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else ".")
 MAX_CONCURRENCY = int(sys.argv[3]) if len(sys.argv) > 3 else 32
+WORKER_MODE = sys.argv[4] if len(sys.argv) > 4 else "oneshot"
+if WORKER_MODE not in ("oneshot", "persistent"):
+    raise SystemExit("worker mode must be oneshot or persistent")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, ".dogfood-work")
 shutil.rmtree(WORK, ignore_errors=True)
@@ -181,7 +184,7 @@ def empty_maxima():
 concurrency_port = free_port()
 with open(os.path.join(WORK, "concurrency.f"), "w", encoding="utf-8") as output:
     output.write(f'''@import("http")
-app := http.server({{"host":"127.0.0.1","port":{concurrency_port},"max_requests":42,"max_concurrency":{MAX_CONCURRENCY},"backlog":64}})
+app := http.server({{"host":"127.0.0.1","port":{concurrency_port},"max_requests":42,"max_concurrency":{MAX_CONCURRENCY},"worker_mode":"{WORKER_MODE}","worker_pool_size":{MAX_CONCURRENCY},"backlog":64}})
 http.get(app, "/", (request) => {{
     run("sh", "-c", "sleep 0.04")
     return http.text("ok")
@@ -195,9 +198,15 @@ concurrency_server = subprocess.Popen(
 concurrency_helper = wait_child(concurrency_server.pid)
 if request(concurrency_port) != (200, b"ok"):
     raise RuntimeError("concurrency warm-up request failed")
+idle_descendants = descendants(concurrency_server.pid)
 concurrency_idle = {
     "parent_rss_kib": rss_kib(concurrency_server.pid),
     "helper_rss_kib": rss_kib(concurrency_helper),
+    "worker_processes": len(children(concurrency_helper)),
+    "topology_processes": 1 + len(idle_descendants),
+    "topology_rss_kib": rss_kib(concurrency_server.pid) + sum(
+        rss_kib(pid) for pid in idle_descendants
+    ),
 }
 concurrency_results = {}
 
@@ -257,7 +266,7 @@ with open(os.path.join(WORK, "download.bin"), "wb") as output:
 resource_port = free_port()
 with open(os.path.join(WORK, "resources.f"), "w", encoding="utf-8") as output:
     output.write(f'''@import("http")
-app := http.server({{"host":"127.0.0.1","port":{resource_port},"max_requests":2,"max_body_bytes":2097152,"max_file_bytes":1048576,"max_temp_bytes":3145728,"max_file_response_bytes":4194304}})
+app := http.server({{"host":"127.0.0.1","port":{resource_port},"max_requests":2,"worker_mode":"{WORKER_MODE}","worker_pool_size":1,"max_body_bytes":2097152,"max_file_bytes":1048576,"max_temp_bytes":3145728,"max_file_response_bytes":4194304}})
 http.post(app, "/upload", (request) => {{
     result := http.save_upload(request.files.attachment, "saved.bin")
     run("sh", "-c", "sleep 0.15")
@@ -340,8 +349,9 @@ if cleanup_usage != (0, 0, 0):
 
 report = {
     "platform": sys.platform,
-    "architecture": "bounded helper, one fresh Nift worker per request",
+    "architecture": f"bounded helper, {WORKER_MODE} Nift workers",
     "max_concurrency": MAX_CONCURRENCY,
+    "worker_mode": WORKER_MODE,
     "idle_rss_kib": concurrency_idle,
     "resource_idle_rss_kib": resource_idle,
     "concurrency": concurrency_results,
