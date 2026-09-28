@@ -139,7 +139,7 @@ fn(http_response_headers(kind, options)) {
     if(kind == "json") { headers["content-type"] = ["application/json; charset=utf-8"] }
     else { headers["content-type"] = ["text/plain; charset=utf-8"] }
     if(options.has("headers") && type(options.headers) == "object") {
-        for((name, value) : options.headers) { headers[name] = value }
+        for((header_name, header_value) : options.headers) { headers[header_name] = header_value }
     }
     return headers
 }
@@ -233,6 +233,12 @@ fn(http_listen(app)) {
     port := http_config_value(config, "port", 8080)
     max_requests := http_config_value(config, "max_requests", 0)
     worker_timeout := http_config_value(config, "worker_timeout_ms", 30000)
+    client_timeout := http_config_value(config, "client_timeout_ms", 10000)
+    max_request_line := http_config_value(config, "max_request_line", 8192)
+    max_header_bytes := http_config_value(config, "max_header_bytes", 32768)
+    max_headers := http_config_value(config, "max_headers", 100)
+    max_body_bytes := http_config_value(config, "max_body_bytes", 1048576)
+    backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
         "--host", host,
@@ -241,7 +247,13 @@ fn(http_listen(app)) {
         "--app", cmd,
         "--cwd", pwd(),
         "--max-requests", max_requests.to_string(),
-        "--worker-timeout-ms", worker_timeout.to_string()
+        "--worker-timeout-ms", worker_timeout.to_string(),
+        "--client-timeout-ms", client_timeout.to_string(),
+        "--max-request-line", max_request_line.to_string(),
+        "--max-header-bytes", max_header_bytes.to_string(),
+        "--max-headers", max_headers.to_string(),
+        "--max-body-bytes", max_body_bytes.to_string(),
+        "--backlog", backlog.to_string()
     )
     if(!result.launched) {
         return {"ok":false,"error":"failed to launch HTTP helper","error_code":"helper_launch","backend":"process","exit_code":result.exit_code}
@@ -250,6 +262,11 @@ fn(http_listen(app)) {
         return {"ok":false,"error":result.stderr,"error_code":"helper_failed","backend":"process","exit_code":result.exit_code}
     }
     return {"ok":true,"error":"","error_code":"","backend":"process","exit_code":0}
+}
+
+fn(http_server_backend(app)) {
+    if(!http_is_server(app)) { return null }
+    return http_server_backends.get(app._server_id)
 }
 
 @struct(http_api) {
@@ -268,6 +285,7 @@ fn(http_listen(app)) {
         "persistent_workers":false
     } }
     server := (config) => http_server(config)
+    server_backend := (app) => http_server_backend(app)
     route := (app, method, path, handler) => http_add_route(app, method.to_upper(), path, handler)
     get := (app, path, handler) => http_add_route(app, "GET", path, handler)
     post := (app, path, handler) => http_add_route(app, "POST", path, handler)

@@ -76,17 +76,19 @@ Defaults are an 8 KiB request line, 32 KiB total header section, 100 headers,
 1 MiB body and 30 second worker deadline. The helper accepts HTTP/1.0 and 1.1,
 one request per connection, and always closes the connection. It rejects
 transfer encoding, duplicate `Content-Length`, folded headers, control bytes,
-invalid percent escapes and malformed request syntax.
+invalid percent escapes and malformed request syntax. HTTP/1.1 requires exactly
+one non-empty `Host` header.
 
 Malformed wire input receives a bounded 4xx/501 response without starting a
 worker. Worker timeout receives 504. Worker launch, nonzero exit, missing or
 invalid response metadata receives 500. The helper generates framing headers
 and rejects application hop-by-hop headers.
 
-The helper owns and removes every exchange directory. On POSIX each worker is
-placed in a new process group; shutdown and timeout terminate the group before
-cleanup. Windows uses a new process group but does not yet have Job Object
-coverage, so Windows support remains unverified.
+The helper owns and removes every exchange directory. It monitors its Nift
+parent and exits if that parent disappears. On POSIX each worker is placed in a
+new process group; shutdown and timeout terminate the group before cleanup.
+Windows uses a new process group but does not yet have Job Object coverage, so
+Windows support remains unverified.
 
 This protocol is one-shot in CP04-CP06. A future persistent worker can reuse the
 same request/response envelope and request IDs over a separate control channel;

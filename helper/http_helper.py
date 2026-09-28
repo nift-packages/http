@@ -22,7 +22,8 @@ HOP_BY_HOP = {
     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
 }
 REASONS = {
-    200: "OK", 400: "Bad Request", 404: "Not Found",
+    200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request",
+    404: "Not Found", 414: "URI Too Long",
     405: "Method Not Allowed", 408: "Request Timeout",
     413: "Payload Too Large", 431: "Request Header Fields Too Large",
     500: "Internal Server Error", 501: "Not Implemented",
@@ -105,6 +106,8 @@ def read_request(conn, address, args, request_id, request_dir):
 
     if "transfer-encoding" in headers:
         raise HttpError(501, "transfer encoding is not supported")
+    if version == "HTTP/1.1" and (len(headers.get("host", [])) != 1 or not headers["host"][0]):
+        raise HttpError(400, "HTTP/1.1 requires exactly one Host header")
     if len(content_lengths) > 1:
         raise HttpError(400, "duplicate content-length is not accepted")
     length = 0
@@ -302,6 +305,7 @@ def send_response(conn, status, body, headers=(), method="GET"):
 
 def serve(args):
     state = {"stop": False, "worker": None}
+    parent_pid = os.getppid()
 
     def stop(_signum, _frame):
         state["stop"] = True
@@ -319,6 +323,8 @@ def serve(args):
     handled = 0
     try:
         while not state["stop"] and (args.max_requests == 0 or handled < args.max_requests):
+            if os.getppid() != parent_pid:
+                break
             try:
                 conn, address = server.accept()
             except socket.timeout:

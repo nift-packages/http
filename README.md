@@ -23,6 +23,7 @@ result := http.listen(app)
 The server handle is package data and all stateful behavior remains on the
 `http` facade. `listen()` blocks until shutdown. For deterministic tests,
 `max_requests` may stop the helper after a finite number of accepted requests.
+`http.server_backend(app)` reports the concrete backend pinned to that server.
 
 Backend inspection follows the package convention:
 
@@ -46,6 +47,22 @@ additional method. Static segments and `:name` parameters are matched in Nift;
 HEAD falls back to a matching GET route while the helper suppresses its body.
 Request objects provide `method`, `target`, decoded `path`, `params`, `query`,
 lowercase array-valued `headers`, `body`, parsed `json` and `remote_addr`.
+
+Response options support custom status and headers:
+
+```nift
+return http.json({"created": true}, {
+    "status": 201,
+    "headers": {"x-resource": "42"}
+})
+```
+
+Server options can lower the finite defaults for `max_request_line`,
+`max_header_bytes`, `max_headers`, `max_body_bytes`, `client_timeout_ms`,
+`worker_timeout_ms` and `backlog`. HTTP/1.1 requires exactly one Host header;
+transfer encoding and duplicate Content-Length are rejected. JSON request
+bodies are decoded by the helper into `request.json`; malformed JSON receives
+400 without invoking application code.
 
 Current scope is plain HTTP/1.0 and HTTP/1.1 with `Connection: close`. TLS,
 streaming, multipart, WebSockets, persistent workers, FFI and native modules are
