@@ -7,6 +7,7 @@ from email.utils import format_datetime, parsedate_to_datetime
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -502,6 +503,15 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
         request["_body_path"] = private_body_path
     if uploads:
         request["_uploads"] = uploads
+    if os.name == "posix" and hasattr(os, "mkfifo"):
+        stream_path = os.path.join(request_dir, "response.pipe")
+        try:
+            os.mkfifo(stream_path, 0o600)
+        except OSError:
+            pass
+        else:
+            request["_stream_path"] = stream_path
+            request["_stream_done_path"] = os.path.join(request_dir, "response.done")
     request_state["path"] = path
     request_path = os.path.join(request_dir, "request.json")
     with open(request_path, "w", encoding="utf-8") as output:
@@ -571,6 +581,8 @@ def start_diagnostic_drain(process, name):
 def load_worker_response(response_path, request):
     try:
         with open(response_path, encoding="utf-8") as source:
+            if os.fstat(source.fileno()).st_size > 1048576:
+                raise HttpError(500, "application response metadata exceeds limit")
             response = json.load(source)
     except (OSError, json.JSONDecodeError) as exc:
         raise HttpError(500, "application worker produced no valid response") from exc
@@ -581,8 +593,116 @@ def load_worker_response(response_path, request):
     return response
 
 
-def run_oneshot_worker(args, request, request_path, request_dir, state, request_id):
+def response_is_stream(response):
+    body = response.get("body")
+    return isinstance(body, dict) and body.get("kind") == "stream"
+
+
+def client_connection_reset(conn):
+    try:
+        if conn.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+            return True
+        readable, _writable, _exceptional = select.select([conn], [], [], 0)
+        if not readable:
+            return False
+        return conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except (BlockingIOError, socket.timeout):
+        return False
+    except (ConnectionResetError, OSError):
+        return True
+    return False
+
+
+def open_stream_source(request):
+    path = request.get("_stream_path")
+    if not isinstance(path, str):
+        return None
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISFIFO(metadata.st_mode):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except OSError:
+        return None
+
+
+class OneShotWorkerLease:
+    def __init__(self, process, diagnostic, drain, state, request_id, deadline, source, done_path):
+        self.process = process
+        self.diagnostic = diagnostic
+        self.drain = drain
+        self.state = state
+        self.request_id = request_id
+        self.deadline = deadline
+        self.source = source
+        self.done_path = done_path
+        self.finished = False
+
+    def finish(self, success):
+        if self.finished:
+            return
+        self.finished = True
+        if self.source is not None:
+            os.close(self.source)
+        if success:
+            try:
+                self.process.wait(timeout=max(0, self.deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                success = False
+        if self.process.poll() is not None and self.process.returncode != 0:
+            diagnostic = self.diagnostic.decode("utf-8", "replace").strip()
+            if diagnostic:
+                print(f"http helper: streaming worker failed: {diagnostic}", file=sys.stderr)
+        if not success or self.process.poll() is None:
+            terminate_process(self.process)
+        else:
+            # A completed worker may have left descendants in its process group.
+            terminate_process(self.process)
+        self.state.unregister_worker(self.request_id, self.process)
+        self.drain.join(timeout=1)
+        self.process.stdout.close()
+        self.state.worker_finished()
+
+
+class PersistentWorkerLease:
+    def __init__(self, pool, worker, state, request_id, deadline, source, done_path):
+        self.pool = pool
+        self.worker = worker
+        self.state = state
+        self.request_id = request_id
+        self.deadline = deadline
+        self.source = source
+        self.done_path = done_path
+        self.finished = False
+
+    @property
+    def process(self):
+        return self.worker.process
+
+    def finish(self, success):
+        if self.finished:
+            return
+        self.finished = True
+        if self.source is not None:
+            os.close(self.source)
+        self.state.unregister_worker(self.request_id, self.worker.process)
+        if not success and self.worker.process.poll() is not None:
+            diagnostic = self.worker.diagnostic.decode("utf-8", "replace").strip()
+            if diagnostic:
+                print(f"http helper: streaming worker failed: {diagnostic}", file=sys.stderr)
+        recycle = success and self.worker.requests >= self.pool.args.worker_max_requests
+        self.pool.release(
+            self.worker,
+            replace=not success or recycle,
+            reason="recycle" if recycle else ("failure" if not success else None),
+        )
+
+
+def run_oneshot_worker(args, request, request_path, request_dir, state, request_id, conn):
     response_path = os.path.join(request_dir, "response.json")
+    stream_source = open_stream_source(request)
     environment = dict(os.environ)
     environment.update({
         "NIFT_HTTP_WORKER": "1",
@@ -597,36 +717,65 @@ def run_oneshot_worker(args, request, request_path, request_dir, state, request_
             start_new_session=os.name == "posix", creationflags=creationflags,
         )
     except OSError as exc:
+        if stream_source is not None:
+            os.close(stream_source)
         raise HttpError(500, f"worker launch failed: {exc}") from exc
     state.worker_started()
     try:
         diagnostic, drain = start_diagnostic_drain(process, f"http-worker-log-{request_id}")
     except OSError:
         state.worker_finished()
+        if stream_source is not None:
+            os.close(stream_source)
         raise
     if not state.register_worker(request_id, process, request_id):
         terminate_process(process)
         drain.join(timeout=1)
         process.stdout.close()
         state.worker_finished()
+        if stream_source is not None:
+            os.close(stream_source)
         raise HttpError(500, "server is shutting down")
+    deadline = time.monotonic() + args.worker_timeout_ms / 1000.0
+    response = None
+    handed_off = False
     try:
-        process.wait(timeout=args.worker_timeout_ms / 1000.0)
-    except subprocess.TimeoutExpired as exc:
-        terminate_process(process)
-        raise HttpError(504, "application worker timed out") from exc
+        while True:
+            if response is None and os.path.exists(response_path):
+                response = load_worker_response(response_path, request)
+                if response_is_stream(response):
+                    if stream_source is None:
+                        raise HttpError(500, "dynamic streaming is unavailable")
+                    lease = OneShotWorkerLease(
+                        process, diagnostic, drain, state, request_id, deadline, stream_source,
+                        request.get("_stream_done_path"),
+                    )
+                    handed_off = True
+                    return response, str(request_id), lease
+            if process.poll() is not None:
+                break
+            if state.aborting.is_set() or client_connection_reset(conn):
+                raise HttpError(499, "application worker cancelled")
+            if time.monotonic() >= deadline:
+                raise HttpError(504, "application worker timed out")
+            time.sleep(0.002)
+        if process.returncode != 0:
+            diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
+            if diagnostic_text:
+                print(f"http helper: worker failed: {diagnostic_text}", file=sys.stderr)
+            raise HttpError(500, "application worker failed")
+        if response is None:
+            response = load_worker_response(response_path, request)
+        return response, str(request_id), None
     finally:
-        terminate_process(process)
-        state.unregister_worker(request_id, process)
-        drain.join(timeout=1)
-        process.stdout.close()
-        state.worker_finished()
-    if process.returncode != 0:
-        diagnostic_text = diagnostic.decode("utf-8", "replace").strip()
-        if diagnostic_text:
-            print(f"http helper: worker failed: {diagnostic_text}", file=sys.stderr)
-        raise HttpError(500, "application worker failed")
-    return load_worker_response(response_path, request), str(request_id)
+        if not handed_off:
+            terminate_process(process)
+            state.unregister_worker(request_id, process)
+            drain.join(timeout=1)
+            process.stdout.close()
+            state.worker_finished()
+            if stream_source is not None:
+                os.close(stream_source)
 
 
 class PersistentWorker:
@@ -914,15 +1063,18 @@ class PersistentWorkerPool:
             self.condition.notify_all()
 
 
-def run_persistent_worker(args, request, request_dir, state, request_id):
+def run_persistent_worker(args, request, request_dir, state, request_id, conn):
     response_path = os.path.join(request_dir, "response.json")
     deadline = time.monotonic() + args.worker_timeout_ms / 1000.0
+    stream_source = None
     worker = state.pool.acquire(state, deadline)
     replace = False
     replacement_reason = None
+    handed_off = False
     if not state.register_worker(request_id, worker.process, worker.worker_id):
         state.pool.release(worker, replace=True, reason="shutdown")
         raise HttpError(500, "server is shutting down")
+    stream_source = open_stream_source(request)
     try:
         try:
             worker.process.stdin.write((request_dir + "\n").encode("utf-8"))
@@ -947,6 +1099,10 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
                 replace = True
                 replacement_reason = "failure"
                 raise HttpError(500, "server is shutting down")
+            if client_connection_reset(conn):
+                replace = True
+                replacement_reason = "failure"
+                raise HttpError(499, "application worker cancelled")
             if time.monotonic() >= deadline:
                 replace = True
                 replacement_reason = "failure"
@@ -959,19 +1115,33 @@ def run_persistent_worker(args, request, request_dir, state, request_id):
             replace = True
             replacement_reason = "failure"
             raise
+        if response_is_stream(response):
+            if stream_source is None:
+                replace = True
+                replacement_reason = "failure"
+                raise HttpError(500, "dynamic streaming is unavailable")
+            lease = PersistentWorkerLease(
+                state.pool, worker, state, request_id, deadline, stream_source,
+                request.get("_stream_done_path"),
+            )
+            handed_off = True
+            return response, str(worker.worker_id), lease
         if worker.requests >= args.worker_max_requests:
             replace = True
             replacement_reason = "recycle"
-        return response, str(worker.worker_id)
+        return response, str(worker.worker_id), None
     finally:
-        state.unregister_worker(request_id, worker.process)
-        state.pool.release(worker, replace=replace, reason=replacement_reason)
+        if not handed_off:
+            state.unregister_worker(request_id, worker.process)
+            state.pool.release(worker, replace=replace, reason=replacement_reason)
+            if stream_source is not None:
+                os.close(stream_source)
 
 
-def run_worker(args, request, request_path, request_dir, state, request_id):
+def run_worker(args, request, request_path, request_dir, state, request_id, conn):
     if args.worker_mode == "persistent":
-        return run_persistent_worker(args, request, request_dir, state, request_id)
-    return run_oneshot_worker(args, request, request_path, request_dir, state, request_id)
+        return run_persistent_worker(args, request, request_dir, state, request_id, conn)
+    return run_oneshot_worker(args, request, request_path, request_dir, state, request_id, conn)
 
 
 def open_root_file(root, relative, cwd):
@@ -1178,9 +1348,52 @@ def response_parts(response, request=None, args=None):
         return status, headers, {
             "kind": "file", "source": source, "offset": offset, "length": length,
         }
+    elif kind == "stream":
+        if status in (204, 205, 304):
+            raise HttpError(500, "stream responses cannot use a bodyless status")
+        return status, headers, {"kind": "stream"}
     else:
         raise HttpError(500, "unsupported application response body kind")
     return status, headers, {"kind": "bytes", "data": payload}
+
+
+def send_stream(conn, body, emit=True):
+    lease = body["lease"]
+    args = body["args"]
+    state = body["state"]
+    total = 0
+    while True:
+        if state.aborting.is_set() or time.monotonic() >= lease.deadline:
+            raise OSError("stream cancelled")
+        if client_connection_reset(conn):
+            raise OSError("stream client disconnected")
+        readable, _writable, _exceptional = select.select([lease.source], [], [], 0.02)
+        if readable:
+            try:
+                chunk = os.read(lease.source, args.max_stream_chunk_bytes)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > args.max_stream_response_bytes:
+                raise OSError("stream response exceeds configured limit")
+        elif isinstance(lease.done_path, str) and os.path.exists(lease.done_path):
+            if emit:
+                conn.sendall(b"0\r\n\r\n")
+            return
+        elif lease.process.poll() is not None:
+            raise OSError("stream worker exited before completion")
+        else:
+            continue
+        remaining = lease.deadline - time.monotonic()
+        if remaining <= 0:
+            raise OSError("stream worker timed out")
+        conn.settimeout(min(args.response_timeout_ms / 1000.0, remaining))
+        if emit:
+            conn.sendall(f"{len(chunk):x}\r\n".encode("ascii"))
+            conn.sendall(chunk)
+            conn.sendall(b"\r\n")
 
 
 def send_response(conn, status, body, headers=(), method="GET"):
@@ -1189,9 +1402,13 @@ def send_response(conn, status, body, headers=(), method="GET"):
         body = {"kind": "bytes", "data": body.encode("utf-8")}
     elif isinstance(body, bytes):
         body = {"kind": "bytes", "data": body}
-    if not isinstance(body, dict) or body.get("kind") not in ("bytes", "file"):
+    if not isinstance(body, dict) or body.get("kind") not in ("bytes", "file", "stream"):
         raise HttpError(500, "invalid response body plan")
-    length = len(body["data"]) if body["kind"] == "bytes" else body["length"]
+    length = None
+    if body["kind"] == "bytes":
+        length = len(body["data"])
+    elif body["kind"] == "file":
+        length = body["length"]
     lines = [f"HTTP/1.1 {status} {reason}\r\n"]
     seen_type = False
     for name, value in headers:
@@ -1200,12 +1417,21 @@ def send_response(conn, status, body, headers=(), method="GET"):
         lines.append(f"{name}: {value}\r\n")
     if not seen_type:
         lines.append("Content-Type: text/plain; charset=utf-8\r\n")
-    no_body_status = status in (204, 304)
-    if not no_body_status:
+    no_body_status = status in (204, 205, 304)
+    if body["kind"] == "stream" and not no_body_status:
+        lines.append("Transfer-Encoding: chunked\r\n")
+    elif not no_body_status:
         lines.append(f"Content-Length: {length}\r\n")
     lines.append("Connection: close\r\n\r\n")
     conn.sendall("".join(lines).encode("latin-1"))
-    if method == "HEAD" or no_body_status:
+    if method == "HEAD":
+        if body["kind"] == "stream":
+            send_stream(conn, body, emit=False)
+        return
+    if no_body_status:
+        return
+    if body["kind"] == "stream":
+        send_stream(conn, body)
         return
     if body["kind"] == "bytes":
         conn.sendall(body["data"])
@@ -1230,8 +1456,9 @@ def send_response(conn, status, body, headers=(), method="GET"):
 def safe_send_response(conn, status, body, headers=(), method="GET"):
     try:
         send_response(conn, status, body, headers, method)
+        return True
     except (BrokenPipeError, ConnectionResetError, socket.timeout, UnicodeEncodeError, OSError):
-        pass
+        return False
     finally:
         if isinstance(body, dict) and body.get("kind") == "file":
             body["source"].close()
@@ -1258,7 +1485,7 @@ class ServerState:
         self.metrics = {
             "accepted": 0, "admitted": 0, "rejected": 0, "completed": 0,
             "errors": 0, "worker_starts": 0, "worker_restarts": 0,
-            "worker_recycles": 0,
+            "worker_recycles": 0, "stream_completed": 0, "stream_failed": 0,
         }
         self.status_path = None
         self.event_log_path = None
@@ -1357,6 +1584,11 @@ class ServerState:
             self.metrics[name] += amount
             self.write_status_locked()
 
+    def record_stream(self, completed):
+        with self.lock:
+            self.metrics["stream_completed" if completed else "stream_failed"] += 1
+            self.write_status_locked()
+
     def worker_started(self):
         with self.lock:
             self.metrics["worker_starts"] += 1
@@ -1376,7 +1608,10 @@ class ServerState:
         if len(encoded.encode("utf-8")) > self.max_event_log_bytes:
             event = {
                 key: value for key, value in event.items()
-                if key in ("time", "event", "request_id", "worker_id", "status", "duration_ms")
+                if key in (
+                    "time", "event", "request_id", "worker_id", "status",
+                    "duration_ms", "stream_complete",
+                )
             }
             event["truncated"] = True
             encoded = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -1545,6 +1780,8 @@ def handle_connection(args, state, conn, address, request_id, request_dir):
     request_state = {"method": "GET", "path": ""}
     payload = None
     worker_id = None
+    worker_lease = None
+    stream_complete = False
     status = 499
     started = time.perf_counter()
     try:
@@ -1554,12 +1791,17 @@ def handle_connection(args, state, conn, address, request_id, request_dir):
                 request, request_path = read_request(
                     conn, address, args, request_id, request_dir, request_state,
                 )
-                response, worker_id = run_worker(
-                    args, request, request_path, request_dir, state, request_id,
+                response, worker_id, worker_lease = run_worker(
+                    args, request, request_path, request_dir, state, request_id, conn,
                 )
                 status, headers, payload = response_parts(response, request, args)
+                if payload.get("kind") == "stream":
+                    payload.update({
+                        "lease": worker_lease, "args": args, "state": state,
+                    })
                 conn.settimeout(args.response_timeout_ms / 1000.0)
-                safe_send_response(conn, status, payload, headers, request_state["method"])
+                sent = safe_send_response(conn, status, payload, headers, request_state["method"])
+                stream_complete = sent and payload.get("kind") == "stream"
             except socket.timeout:
                 status = 408
                 safe_send_response(conn, 408, "request timeout", method=request_state["method"])
@@ -1573,12 +1815,17 @@ def handle_connection(args, state, conn, address, request_id, request_dir):
                 print(f"http helper: request failed: {exc}", file=sys.stderr)
                 safe_send_response(conn, 500, "internal server error", method=request_state["method"])
     finally:
+        stream_attempted = worker_lease is not None
+        if worker_lease is not None:
+            worker_lease.finish(stream_complete)
         if isinstance(payload, dict) and payload.get("kind") == "file":
             payload["source"].close()
         shutil.rmtree(request_dir, ignore_errors=True)
-        if status >= 500:
+        if stream_attempted:
+            state.record_stream(stream_complete)
+        if status >= 500 or (stream_attempted and not stream_complete):
             state.increment("errors")
-        state.record_event({
+        event = {
             "event": "request",
             "request_id": str(request_id),
             "worker_id": worker_id or state.request_worker_id(request_id),
@@ -1586,7 +1833,10 @@ def handle_connection(args, state, conn, address, request_id, request_dir):
             "path": request_state["path"],
             "status": status,
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-        })
+        }
+        if stream_attempted:
+            event["stream_complete"] = stream_complete
+        state.record_event(event)
         state.complete(request_id)
 
 
@@ -1728,6 +1978,8 @@ def parse_args(argv):
     parser.add_argument("--max-filename-bytes", type=int, default=255)
     parser.add_argument("--max-temp-bytes", type=int, default=2097152)
     parser.add_argument("--max-file-response-bytes", type=int, default=67108864)
+    parser.add_argument("--max-stream-chunk-bytes", type=int, default=65536)
+    parser.add_argument("--max-stream-response-bytes", type=int, default=67108864)
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--worker-mode", choices=("oneshot", "persistent"), default="oneshot")
     parser.add_argument("--worker-pool-size", type=int, default=1)
@@ -1746,8 +1998,9 @@ def parse_args(argv):
                   "max_body_bytes", "max_form_fields", "max_form_name_bytes",
                   "max_form_value_bytes", "max_cookie_pairs", "max_multipart_parts",
                   "max_multipart_files", "max_part_header_bytes", "max_part_headers",
-                  "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
-                  "max_file_response_bytes", "max_concurrency", "worker_pool_size",
+                   "max_file_bytes", "max_filename_bytes", "max_temp_bytes",
+                  "max_file_response_bytes", "max_stream_chunk_bytes",
+                  "max_stream_response_bytes", "max_concurrency", "worker_pool_size",
                   "worker_max_requests", "shutdown_grace_ms", "admission_timeout_ms",
                   "backlog"):
         if getattr(args, name) < 0:
@@ -1760,6 +2013,10 @@ def parse_args(argv):
         parser.error("persistent worker-pool-size must equal max-concurrency")
     if args.worker_max_requests == 0:
         parser.error("worker-max-requests must be at least 1")
+    if args.max_stream_chunk_bytes == 0:
+        parser.error("max-stream-chunk-bytes must be at least 1")
+    if args.max_stream_response_bytes == 0:
+        parser.error("max-stream-response-bytes must be at least 1")
     if args.max_event_log_bytes < 4096:
         parser.error("max-event-log-bytes must be at least 4096")
     return args

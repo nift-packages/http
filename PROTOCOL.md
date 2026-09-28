@@ -71,11 +71,10 @@ ordered array. Malformed form/cookie syntax is rejected before worker launch.
 }
 ```
 
-The implementation supports `text`, `json`, `empty`, `file` and `root_file`
-response body kinds. The envelope deliberately leaves room for later stream
-descriptors without changing route or status/header semantics. Arbitrary binary
-request bodies use an opaque package-owned spool rather than exposing its
-private path or requiring bytes to be UTF-8.
+The implementation supports `text`, `json`, `empty`, `file`, `root_file` and
+`stream` response body kinds. A stream envelope contains no pipe, spool or
+worker path. Arbitrary binary request bodies use an opaque package-owned spool
+rather than exposing its private path or requiring bytes to be UTF-8.
 
 Structured response cookies are validated and serialized by the helper into
 one `Set-Cookie` field per descriptor. Raw `set-cookie` headers and structured
@@ -110,6 +109,24 @@ that descriptor and transfers it in file chunks/`sendfile` where available.
 The worker never reads file bytes. Range support is one `bytes` range only;
 invalid, unsatisfiable and multiple ranges return 416.
 
+Dynamic streams use a helper-created request-owned POSIX FIFO plus a separate
+completion marker. Both paths are private request metadata removed before the
+handler runs. The Nift `http.stream()` call atomically publishes the ordinary
+status/header envelope, opens the FIFO and synchronously invokes its producer.
+Producer writes are raw bytes; the helper reads at most
+`max_stream_chunk_bytes`, applies `max_stream_response_bytes`, and owns HTTP/1.1
+chunked framing. The FIFO and socket buffers provide bounded flow control: a
+producer blocks when the client/helper cannot consume more data. The completion
+marker is created only after the producer and outer route handler both return.
+This keeps one-shot and persistent worker leases active for the full request.
+
+Worker stdout remains diagnostics and is never a stream channel. A stream that
+fails after headers or bytes were committed ends without the terminal HTTP
+chunk; no second 500 response is appended. HEAD skips the producer but waits for
+outer handler completion. Streamed 204, 205 and 304 bodies are invalid. Stream
+paths and completion state never enter application-visible request values or the
+response envelope.
+
 ## Channel ownership
 
 Protocol framing never uses worker stdout or stderr. The helper continuously
@@ -127,6 +144,10 @@ request per connection, and always closes the connection. It rejects
 transfer encoding, duplicate `Content-Length`, folded headers, control bytes,
 invalid percent escapes and malformed request syntax. HTTP/1.1 requires exactly
 one non-empty `Host` header.
+
+TCP request-side half-close is unsupported. EOF is client cancellation even if
+the peer keeps its read side open; this is part of the current one-request,
+`Connection: close` process-backend contract.
 
 Malformed wire input receives a bounded 4xx/501 response without starting a
 worker. Worker timeout receives 504. Worker launch, nonzero exit, missing or

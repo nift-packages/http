@@ -11,6 +11,12 @@ http_server_configs := map()
 http_server_route_counts := map()
 http_server_routes := map()
 http_spool_paths := map()
+http_worker_response_path := ""
+http_worker_stream_path := ""
+http_worker_stream_done_path := ""
+http_worker_request_id := ""
+http_worker_request_method := ""
+http_worker_stream_published := false
 
 fn(http_helper_path()) {
     return pwd() + "/.nift/packages/http/helper/http_helper.py"
@@ -212,6 +218,49 @@ fn(http_root_file_response(root, path, option_values)) {
     return {"status":status,"headers":http_response_headers("file", options),"body":body}
 }
 
+fn(http_stream_response(producer, option_values)) {
+    options := http_options(option_values)
+    status := 200
+    if(options.has("status")) { status = options.status }
+    response := {
+        "status":status,
+        "headers":http_response_headers("stream", options),
+        "body":{"kind":"stream","_producer":producer}
+    }
+    if(options.has("cookies")) { response["cookies"] = options.cookies }
+    if(status == 204 || status == 205 || status == 304) {
+        response["body"] = {"kind":"stream"}
+        return response
+    }
+    if(http_worker_response_path != "" && http_worker_stream_path != "" &&
+       http_worker_stream_done_path != "" &&
+       type(producer) == "function") {
+        public_response := response.omit(["body"])
+        public_response["body"] = {"kind":"stream"}
+        envelope := {
+            "protocol":1,
+            "request_id":http_worker_request_id,
+            "status":public_response.status,
+            "headers":public_response.headers,
+            "body":public_response.body
+        }
+        if(public_response.has("cookies")) { envelope["cookies"] = public_response.cookies }
+        http_publish_worker_response(http_worker_response_path, envelope)
+        http_worker_stream_published = true
+        if(http_worker_request_method != "HEAD") {
+            stream_output := ofstream(http_worker_stream_path)
+            write_chunk := (chunk) => {
+                stream_output.write(chunk)
+                stream_output.flush()
+            }
+            producer(write_chunk)
+            close(stream_output)
+        }
+        return public_response
+    }
+    return response
+}
+
 fn(http_dispatch(app, request)) {
     allowed := []
     selected_index := -1
@@ -295,7 +344,7 @@ fn(http_prepare_request(request)) {
     }
     request["uploads"] = public_uploads
     request["files"] = files
-    return request.omit(["_body_path", "_uploads"])
+    return request.omit(["_body_path", "_uploads", "_stream_path", "_stream_done_path"])
 }
 
 fn(http_save_upload(upload, destination)) {
@@ -327,11 +376,7 @@ fn(http_expire_request_spools(request)) {
     }
 }
 
-fn(http_worker_envelope(app, request_path)) {
-    request := inject(request_path)
-    request = http_prepare_request(request)
-    response := http_dispatch(app, request)
-    http_expire_request_spools(request)
+fn(http_response_envelope(request, response)) {
     envelope := {
         "protocol":1,
         "request_id":request.request_id,
@@ -343,11 +388,48 @@ fn(http_worker_envelope(app, request_path)) {
     return envelope
 }
 
-fn(http_write_worker_response(app)) {
-    envelope := http_worker_envelope(app, getenv("NIFT_HTTP_REQUEST"))
-    output := ofstream(getenv("NIFT_HTTP_RESPONSE"))
+fn(http_publish_worker_response(path, envelope)) {
+    temporary_path := path + ".tmp"
+    output := ofstream(temporary_path)
     output.write_val(envelope)
     close(output)
+    move(temporary_path, path)
+}
+
+fn(http_execute_worker_request(app, request_path, response_path)) {
+    private_request := inject(request_path)
+    stream_path := ""
+    if(private_request.has("_stream_path")) { stream_path = private_request._stream_path }
+    stream_done_path := ""
+    if(private_request.has("_stream_done_path")) { stream_done_path = private_request._stream_done_path }
+    request := http_prepare_request(private_request)
+    http_worker_response_path = response_path
+    http_worker_stream_path = stream_path
+    http_worker_stream_done_path = stream_done_path
+    http_worker_request_id = request.request_id
+    http_worker_request_method = request.method
+    http_worker_stream_published = false
+    response := http_dispatch(app, request)
+    if(http_worker_stream_published) {
+        done_output := ofstream(http_worker_stream_done_path)
+        done_output.write("done")
+        close(done_output)
+        http_expire_request_spools(request)
+        http_worker_response_path = ""
+        http_worker_stream_path = ""
+        http_worker_stream_done_path = ""
+        return
+    }
+    http_expire_request_spools(request)
+    envelope := http_response_envelope(request, response)
+    http_publish_worker_response(response_path, envelope)
+    http_worker_response_path = ""
+    http_worker_stream_path = ""
+    http_worker_stream_done_path = ""
+}
+
+fn(http_write_worker_response(app)) {
+    http_execute_worker_request(app, getenv("NIFT_HTTP_REQUEST"), getenv("NIFT_HTTP_RESPONSE"))
     return {"ok":true,"error":"","error_code":"","backend":"process"}
 }
 
@@ -363,12 +445,7 @@ fn(http_run_persistent_worker(app)) {
         if(exchange == null) { break }
         request_path := exchange + "/request.json"
         response_path := exchange + "/response.json"
-        temporary_path := exchange + "/response.tmp"
-        envelope := http_worker_envelope(app, request_path)
-        output := ofstream(temporary_path)
-        output.write_val(envelope)
-        close(output)
-        move(temporary_path, response_path)
+        http_execute_worker_request(app, request_path, response_path)
     }
     return {"ok":true,"error":"","error_code":"","backend":"process"}
 }
@@ -418,6 +495,8 @@ fn(http_listen(app)) {
     max_filename_bytes := http_config_value(config, "max_filename_bytes", 255)
     max_temp_bytes := http_config_value(config, "max_temp_bytes", 2097152)
     max_file_response_bytes := http_config_value(config, "max_file_response_bytes", 67108864)
+    max_stream_chunk_bytes := http_config_value(config, "max_stream_chunk_bytes", 65536)
+    max_stream_response_bytes := http_config_value(config, "max_stream_response_bytes", 67108864)
     max_concurrency := http_config_value(config, "max_concurrency", 1)
     worker_mode := http_config_value(config, "worker_mode", "oneshot")
     worker_pool_size := http_config_value(config, "worker_pool_size", max_concurrency)
@@ -455,6 +534,8 @@ fn(http_listen(app)) {
         "--max-filename-bytes", max_filename_bytes.to_string(),
         "--max-temp-bytes", max_temp_bytes.to_string(),
         "--max-file-response-bytes", max_file_response_bytes.to_string(),
+        "--max-stream-chunk-bytes", max_stream_chunk_bytes.to_string(),
+        "--max-stream-response-bytes", max_stream_response_bytes.to_string(),
         "--max-concurrency", max_concurrency.to_string(),
         "--worker-mode", worker_mode,
         "--worker-pool-size", worker_pool_size.to_string(),
@@ -494,7 +575,7 @@ fn(http_server_backend(app)) {
         "spooled_bodies":true,
         "uploads":true,
         "multipart":true,
-        "streaming":false,
+        "streaming":os() != "windows",
         "websockets":false,
         "tls":false,
         "persistent_workers":true
@@ -515,6 +596,7 @@ fn(http_server_backend(app)) {
     save_body := (body, destination) => http_save_body(body, destination)
     file := (path, ...options) => http_file_response(path, options)
     file_from := (root, path, ...options) => http_root_file_response(root, path, options)
+    stream := (producer, ...options) => http_stream_response(producer, options)
     listen := (app) => http_listen(app)
 }
 

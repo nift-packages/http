@@ -80,11 +80,18 @@ def http_get(port, path="/"):
 
 
 def children(pid):
+    result = set()
     try:
-        with open(f"/proc/{pid}/task/{pid}/children", encoding="ascii") as source:
-            return [int(value) for value in source.read().split()]
+        tasks = os.listdir(f"/proc/{pid}/task")
     except OSError:
         return []
+    for task in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{task}/children", encoding="ascii") as source:
+                result.update(int(value) for value in source.read().split())
+        except OSError:
+            pass
+    return sorted(result)
 
 
 def wait_child(pid, deadline=5):
@@ -174,10 +181,12 @@ write_app("memory.f", memory_port, 0, 10000)
 memory_server = subprocess.Popen([NIFT, "memory.f"], cwd=WORK, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 while True:
     try:
-        http_get(memory_port)
+        readiness = wait_connect(memory_port)
+        readiness.close()
         break
     except OSError:
         time.sleep(0.002)
+time.sleep(0.05)
 helper_pid = wait_child(memory_server.pid)
 parent_rss = rss_kib(memory_server.pid)
 helper_rss = rss_kib(helper_pid)
@@ -186,21 +195,34 @@ spin_error = []
 
 def spin_request():
     try:
-        connection = http.client.HTTPConnection("127.0.0.1", memory_port, timeout=15)
-        connection.request("GET", "/spin")
-        response = connection.getresponse()
-        response.read()
-        connection.close()
+        while True:
+            connection = http.client.HTTPConnection("127.0.0.1", memory_port, timeout=15)
+            connection.request("GET", "/spin")
+            response = connection.getresponse()
+            if response.status != 503:
+                if response.status != 200:
+                    raise RuntimeError(f"spin request failed with {response.status}")
+                response.read()
+                connection.close()
+                break
+            response.read()
+            connection.close()
+            time.sleep(0.01)
     except Exception as exc:  # Expected when the measured helper is terminated.
         spin_error.append(str(exc))
 
 
 spin_thread = threading.Thread(target=spin_request)
 spin_thread.start()
-worker_pid = wait_child(helper_pid)
+try:
+    worker_pid = wait_child(helper_pid)
+except TimeoutError as exc:
+    raise TimeoutError(f"{exc}; errors={spin_error!r}") from exc
 active_parent_rss = rss_kib(memory_server.pid)
 active_helper_rss = rss_kib(helper_pid)
 worker_rss = rss_kib(worker_pid)
+os.kill(helper_pid, signal.SIGTERM)
+time.sleep(0.05)
 os.kill(helper_pid, signal.SIGTERM)
 spin_thread.join(timeout=5)
 if spin_thread.is_alive():

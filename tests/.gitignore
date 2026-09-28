@@ -1,2 +1,4 @@
 .dogfood-work/
+.gate5-work/
+.streaming-work/
 __pycache__/

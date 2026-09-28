@@ -142,6 +142,38 @@ opens each component without following symlinks. Single byte ranges produce
 are deliberately unsupported. `max_file_response_bytes` and
 `response_timeout_ms` are finite server options.
 
+Dynamic responses use a blocking producer callback on POSIX:
+
+```nift
+return http.stream((write) => {
+    write("first\n")
+    run("sh", "-c", "sleep 0.2")
+    write("second\n")
+}, {"content_type":"text/plain; charset=utf-8"})
+```
+
+`write()` publishes bytes before the producer/handler returns and blocks under
+client backpressure. The helper chooses HTTP chunk boundaries; one call is not
+promised to equal one wire chunk. `max_stream_chunk_bytes` bounds each helper
+read/wire chunk (default 64 KiB), and `max_stream_response_bytes` bounds total
+output (default 64 MiB). The worker deadline includes time blocked by
+backpressure, while `response_timeout_ms` bounds a blocked client write.
+
+Ordinary strings are the text API. Existing arbitrary bytes loaded from a file
+can pass through a Nift string and `write()` without UTF-8 conversion, so binary
+streaming is supported with a file-backed mechanism. Nift has no general byte
+value for clean dynamic arbitrary-byte construction; do not treat text strings
+as an invented byte-buffer API.
+
+Status and headers are committed before the producer runs. Failure, timeout,
+limit violation, disconnect or forced shutdown after the first bytes closes an
+incomplete chunked response; it cannot replace the committed status with 500.
+HEAD publishes headers without invoking the producer but retains the worker
+until the handler returns. Streamed 204, 205 and 304 responses are rejected.
+Dynamic streaming is currently POSIX-only and `capabilities().streaming` is
+false on Windows. TCP request-side half-close is unsupported: EOF is treated as
+client cancellation under this one-request, `Connection: close` protocol.
+
 `max_concurrency` bounds the complete active connection lifecycle and defaults
 to 1. Independent accepted requests run in fresh Nift workers concurrently up
 to that limit. When all slots remain occupied, the helper returns an empty 503
@@ -194,10 +226,10 @@ app := http.server({
 
 The status file is atomically replaced and reports readiness/phase, active
 requests/workers, queue depth, worker process count and accepted/admitted/
-rejected/completed/error/start/restart/recycle counters. The event file contains
-bounded NDJSON request/overload records with request and worker IDs where
-available; it truncates before exceeding `max_event_log_bytes`.
+rejected/completed/error/start/restart/recycle/stream-completion counters. The
+event file contains bounded NDJSON request/overload records with request and
+worker IDs and streaming outcome where available; it truncates before exceeding
+`max_event_log_bytes`.
 
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
-incremental handler streams, WebSockets, FFI and native modules are
-deferred.
+WebSockets, FFI and native modules are deferred.
