@@ -30,6 +30,7 @@ port = free_port()
 source = f'''@import("http")
 app := http.server({{"host":"127.0.0.1","port":{port},"max_requests":8}})
 http.get(app, "/", (request) => http.text("root"))
+http.head(app, "/", (request) => http.text("explicit-head"))
 http.get(app, "/users/:id", (request) => http.json({{"id":request.params.id,"q":request.query.q,"header":request.headers.get("x-test")[0]}}))
 http.post(app, "/method", (request) => http.text("POST"))
 http.put(app, "/method", (request) => http.text("PUT"))
@@ -88,7 +89,7 @@ if results[1][0] != 200 or payload != {"id": "a b", "q": "yes", "header": "prese
 for result, method in zip(results[2:6], (b"POST", b"PUT", b"PATCH", b"DELETE")):
     if result[0] != 200 or result[2] != method:
         raise SystemExit(f"FAIL method route: {result!r}")
-if results[6][0] != 200 or results[6][2] != b"" or results[6][1].get("Content-Length") != "4":
+if results[6][0] != 200 or results[6][2] != b"" or results[6][1].get("Content-Length") != "13":
     raise SystemExit(f"FAIL HEAD fallback: {results[6]!r}")
 if results[7][0] != 404:
     raise SystemExit(f"FAIL missing route: {results[7]!r}")

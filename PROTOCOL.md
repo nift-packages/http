@@ -59,8 +59,9 @@ than the helper.
 The initial implementation supports `text`, `json` and `empty` response body
 kinds. The envelope deliberately leaves room for later package-owned `file`
 and `stream` descriptors without changing route or status/header semantics.
-Request bytes that are not UTF-8 are represented as a private `file` body; CP06
-does not expose a binary reader yet.
+Request bytes that are not UTF-8 receive 415 in CP06. A future package-owned
+binary reader can introduce the reserved `file` body kind without exposing its
+private spool path.
 
 ## Channel ownership
 
@@ -73,8 +74,8 @@ diagnostics belong to its stderr.
 ## Limits and failures
 
 Defaults are an 8 KiB request line, 32 KiB total header section, 100 headers,
-1 MiB body and 30 second worker deadline. The helper accepts HTTP/1.0 and 1.1,
-one request per connection, and always closes the connection. It rejects
+1 MiB body and 30 second worker deadline. The helper accepts HTTP/1.1, one
+request per connection, and always closes the connection. It rejects
 transfer encoding, duplicate `Content-Length`, folded headers, control bytes,
 invalid percent escapes and malformed request syntax. HTTP/1.1 requires exactly
 one non-empty `Host` header.

@@ -30,7 +30,7 @@ fn(http_nift_path()) {
 fn(http_available_now()) {
     if(getenv("NIFT_NO_PROCESS") != null) { return false }
     python := http_python_path()
-    return python != null && exists(http_helper_path())
+    return python != null && http_nift_path() != null && exists(http_helper_path())
 }
 
 fn(http_backend_names()) {
@@ -72,6 +72,9 @@ fn(http_server(config)) {
     backend := http_resolved_backend()
     if(backend != null) { http_backend_selected = backend }
     http_backend_locked = true
+    if(backend == null) {
+        return {"kind":"http_server_error","ok":false,"error":"http process backend is unavailable","error_code":"backend_unavailable","backend":null}
+    }
     http_next_server_id += 1
     id := http_next_server_id
     http_server_backends.set(id, backend)
@@ -95,6 +98,16 @@ fn(http_add_route(app, method, path, handler)) {
     }
     if(type(handler) != "function") {
         return {"ok":false,"error":"route handler must be callable","error_code":"invalid_handler","backend":http_server_backends.get(app._server_id)}
+    }
+    if(type(method) != "string" || method == "") {
+        return {"ok":false,"error":"route method must be a non-empty string","error_code":"invalid_method","backend":http_server_backends.get(app._server_id)}
+    }
+    method = method.to_upper()
+    token_chars := "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for(method_char : method.split("")) {
+        if(!token_chars.contains(method_char)) {
+            return {"ok":false,"error":"route method is not an HTTP token","error_code":"invalid_method","backend":http_server_backends.get(app._server_id)}
+        }
     }
     index := http_server_route_counts.get(app._server_id)
     key := app._server_id.to_string() + ":" + index.to_string()
@@ -139,7 +152,10 @@ fn(http_response_headers(kind, options)) {
     if(kind == "json") { headers["content-type"] = ["application/json; charset=utf-8"] }
     else { headers["content-type"] = ["text/plain; charset=utf-8"] }
     if(options.has("headers") && type(options.headers) == "object") {
-        for((header_name, header_value) : options.headers) { headers[header_name] = header_value }
+        for((header_name, header_value) : options.headers) {
+            lower_header := header_name.to_lower()
+            headers[lower_header] = header_value
+        }
     }
     return headers
 }
@@ -161,7 +177,9 @@ fn(http_json_response(value, option_values)) {
 fn(http_dispatch(app, request)) {
     allowed := []
     selected_index := -1
+    fallback_index := -1
     selected_params := {}
+    fallback_params := {}
     i := 0
     while(i < http_server_route_counts.get(app._server_id)) {
         key := app._server_id.to_string() + ":" + i.to_string()
@@ -169,13 +187,22 @@ fn(http_dispatch(app, request)) {
         params := http_match_route(route.path, request.segments)
         if(params != null) {
             if(!allowed.contains(route.method)) { allowed.push(route.method) }
-            if(route.method == request.method || (request.method == "HEAD" && route.method == "GET")) {
+            if(route.method == "GET" && !allowed.contains("HEAD")) { allowed.push("HEAD") }
+            if(route.method == request.method) {
                 selected_index = i
                 selected_params = params
                 break
             }
+            if(request.method == "HEAD" && route.method == "GET" && fallback_index == -1) {
+                fallback_index = i
+                fallback_params = params
+            }
         }
         i += 1
+    }
+    if(selected_index == -1 && fallback_index != -1) {
+        selected_index = fallback_index
+        selected_params = fallback_params
     }
     if(selected_index == -1) {
         if(allowed.size() > 0) {
@@ -216,6 +243,9 @@ fn(http_config_value(config, name, fallback)) {
 }
 
 fn(http_listen(app)) {
+    if(type(app) == "object" && app.has("kind") && app.kind == "http_server_error") {
+        return {"ok":false,"error":app.error,"error_code":app.error_code,"backend":app.backend,"exit_code":127}
+    }
     if(!http_is_server(app)) {
         return {"ok":false,"error":"invalid http server handle","error_code":"invalid_handle","backend":null,"exit_code":null}
     }
@@ -275,7 +305,6 @@ fn(http_server_backend(app)) {
     backend := () => http_resolved_backend()
     use_backend := (name) => http_use_backend(name)
     capabilities := () => { return {
-        "backend":"process",
         "buffered_text":true,
         "json":true,
         "binary_files":false,
@@ -286,7 +315,7 @@ fn(http_server_backend(app)) {
     } }
     server := (config) => http_server(config)
     server_backend := (app) => http_server_backend(app)
-    route := (app, method, path, handler) => http_add_route(app, method.to_upper(), path, handler)
+    route := (app, method, path, handler) => http_add_route(app, method, path, handler)
     get := (app, path, handler) => http_add_route(app, "GET", path, handler)
     post := (app, path, handler) => http_add_route(app, "POST", path, handler)
     put := (app, path, handler) => http_add_route(app, "PUT", path, handler)

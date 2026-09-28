@@ -23,7 +23,7 @@ HOP_BY_HOP = {
 }
 REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request",
-    404: "Not Found", 414: "URI Too Long",
+    404: "Not Found", 414: "URI Too Long", 415: "Unsupported Media Type",
     405: "Method Not Allowed", 408: "Request Timeout",
     413: "Payload Too Large", 431: "Request Header Fields Too Large",
     500: "Internal Server Error", 501: "Not Implemented",
@@ -57,21 +57,32 @@ def strict_unquote(value):
         raise HttpError(400, "request target is not UTF-8") from exc
 
 
-def recv_headers(conn, limit):
+def set_remaining_timeout(conn, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise socket.timeout()
+    conn.settimeout(remaining)
+
+
+def recv_headers(conn, limit, deadline):
     data = bytearray()
     while b"\r\n\r\n" not in data:
-        chunk = conn.recv(min(4096, limit + 1 - len(data)))
+        set_remaining_timeout(conn, deadline)
+        chunk = conn.recv(4096)
         if not chunk:
             raise HttpError(400, "incomplete request headers")
         data.extend(chunk)
-        if len(data) > limit:
+        if b"\r\n\r\n" not in data and len(data) > limit:
             raise HttpError(431, "request headers are too large")
     marker = data.index(b"\r\n\r\n")
+    if marker > limit:
+        raise HttpError(431, "request headers are too large")
     return bytes(data[:marker]), bytes(data[marker + 4:])
 
 
-def read_request(conn, address, args, request_id, request_dir):
-    header_block, remainder = recv_headers(conn, args.max_header_bytes)
+def read_request(conn, address, args, request_id, request_dir, request_state):
+    deadline = time.monotonic() + args.client_timeout_ms / 1000.0
+    header_block, remainder = recv_headers(conn, args.max_header_bytes, deadline)
     lines = header_block.split(b"\r\n")
     if not lines or len(lines[0]) > args.max_request_line:
         raise HttpError(400 if not lines else 414, "invalid request line")
@@ -80,8 +91,9 @@ def read_request(conn, address, args, request_id, request_dir):
         method, target, version = request_line.split(" ")
     except (UnicodeDecodeError, ValueError) as exc:
         raise HttpError(400, "malformed request line") from exc
-    if not TOKEN.fullmatch(method.encode("ascii")) or version not in ("HTTP/1.0", "HTTP/1.1"):
+    if not TOKEN.fullmatch(method.encode("ascii")) or version != "HTTP/1.1":
         raise HttpError(400, "unsupported request syntax")
+    request_state["method"] = method
     if not target.startswith("/") or "#" in target:
         raise HttpError(400, "only origin-form request targets are supported")
     if len(lines) - 1 > args.max_headers:
@@ -112,13 +124,19 @@ def read_request(conn, address, args, request_id, request_dir):
         raise HttpError(400, "duplicate content-length is not accepted")
     length = 0
     if content_lengths:
-        if not content_lengths[0].isdigit():
+        if not re.fullmatch(r"[0-9]+", content_lengths[0]):
             raise HttpError(400, "invalid content-length")
-        length = int(content_lengths[0])
+        if len(content_lengths[0]) > 20:
+            raise HttpError(413, "request body is too large")
+        try:
+            length = int(content_lengths[0])
+        except ValueError as exc:
+            raise HttpError(400, "invalid content-length") from exc
     if length > args.max_body_bytes:
         raise HttpError(413, "request body is too large")
     body = bytearray(remainder[:length])
     while len(body) < length:
+        set_remaining_timeout(conn, deadline)
         chunk = conn.recv(min(65536, length - len(body)))
         if not chunk:
             raise HttpError(400, "incomplete request body")
@@ -127,6 +145,9 @@ def read_request(conn, address, args, request_id, request_dir):
     raw_path, separator, raw_query = target.partition("?")
     try:
         path = strict_unquote(raw_path)
+        if separator:
+            # Validate escapes before parse_qsl applies form-query decoding.
+            strict_unquote(raw_query.replace("+", " "))
         query_pairs = parse_qsl(raw_query, keep_blank_values=True, strict_parsing=False,
                                 encoding="utf-8", errors="strict") if separator else []
     except (UnicodeDecodeError, ValueError) as exc:
@@ -147,23 +168,23 @@ def read_request(conn, address, args, request_id, request_dir):
         body_text = body.decode("utf-8")
         body_value = {"kind": "text", "text": body_text}
     except UnicodeDecodeError:
-        body_text = None
-        body_value = {"kind": "file", "path": body_path}
+        raise HttpError(415, "binary request bodies are not implemented")
 
     json_value = None
     content_type = headers.get("content-type", [""])[-1].split(";", 1)[0].strip().lower()
-    if body and (content_type == "application/json" or content_type.endswith("+json")):
-        if body_text is None:
-            raise HttpError(400, "JSON body is not UTF-8")
+    if content_type == "application/json" or content_type.endswith("+json"):
         try:
-            json_value = json.loads(body_text)
-        except json.JSONDecodeError as exc:
+            json_value = json.loads(
+                body_text,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
             raise HttpError(400, "malformed JSON body") from exc
 
     request = {
         "protocol": 1,
         "request_id": str(request_id),
-        "method": method.upper(),
+        "method": method,
         "target": target,
         "path": path,
         "segments": [strict_unquote(part) for part in raw_path.split("/")[1:] if part != ""],
@@ -180,22 +201,34 @@ def read_request(conn, address, args, request_id, request_dir):
 
 
 def terminate_process(process):
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-        process.wait(timeout=0.5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    if os.name == "posix":
+        group_signaled = False
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+            os.killpg(process.pid, signal.SIGTERM)
+            group_signaled = True
         except ProcessLookupError:
             pass
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+        if group_signaled:
+            # The group may outlive its leader if application code detached a child.
+            time.sleep(0.02)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    elif process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    if process.poll() is None:
         try:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
@@ -228,6 +261,7 @@ def run_worker(args, request, request_path, request_dir, state):
             terminate_process(process)
             raise HttpError(504, "application worker timed out") from exc
         finally:
+            terminate_process(process)
             state["worker"] = None
     if process.returncode != 0:
         try:
@@ -252,14 +286,20 @@ def run_worker(args, request, request_path, request_dir, state):
 
 def response_parts(response):
     status = response.get("status")
-    if not isinstance(status, int) or isinstance(status, bool) or status < 100 or status > 599:
+    if not isinstance(status, int) or isinstance(status, bool) or status < 200 or status > 599:
         raise HttpError(500, "invalid application response status")
     raw_headers = response.get("headers", {})
     if not isinstance(raw_headers, dict):
         raise HttpError(500, "invalid application response headers")
     headers = []
     for name, values in raw_headers.items():
-        if not isinstance(name, str) or not TOKEN.fullmatch(name.encode("ascii", "ignore")):
+        if not isinstance(name, str):
+            raise HttpError(500, "invalid application response header name")
+        try:
+            encoded_name = name.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise HttpError(500, "invalid application response header name") from exc
+        if not TOKEN.fullmatch(encoded_name):
             raise HttpError(500, "invalid application response header name")
         key = name.lower()
         if key in HOP_BY_HOP:
@@ -267,7 +307,10 @@ def response_parts(response):
         if not isinstance(values, list):
             values = [values]
         for value in values:
-            if not isinstance(value, str) or "\r" in value or "\n" in value:
+            if not isinstance(value, str) or any(
+                ord(char) == 127 or (ord(char) < 32 and char != "\t") or ord(char) > 255
+                for char in value
+            ):
                 raise HttpError(500, "invalid application response header value")
             headers.append((key, value))
     body = response.get("body", {"kind": "empty"})
@@ -281,7 +324,12 @@ def response_parts(response):
             raise HttpError(500, "invalid text response body")
         payload = body["text"].encode("utf-8")
     elif kind == "json":
-        payload = json.dumps(body.get("value"), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            payload = json.dumps(
+                body.get("value"), ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise HttpError(500, "invalid JSON response body") from exc
     else:
         raise HttpError(500, "unsupported application response body kind")
     return status, headers, payload
@@ -298,9 +346,19 @@ def send_response(conn, status, body, headers=(), method="GET"):
         lines.append(f"{name}: {value}\r\n")
     if not seen_type:
         lines.append("Content-Type: text/plain; charset=utf-8\r\n")
-    lines.append(f"Content-Length: {len(payload)}\r\n")
+    no_body_status = status in (204, 304)
+    if not no_body_status:
+        lines.append(f"Content-Length: {len(payload)}\r\n")
     lines.append("Connection: close\r\n\r\n")
-    conn.sendall("".join(lines).encode("latin-1") + (b"" if method == "HEAD" else payload))
+    wire_body = b"" if method == "HEAD" or no_body_status else payload
+    conn.sendall("".join(lines).encode("latin-1") + wire_body)
+
+
+def safe_send_response(conn, status, body, headers=(), method="GET"):
+    try:
+        send_response(conn, status, body, headers, method)
+    except (BrokenPipeError, ConnectionResetError, socket.timeout, UnicodeEncodeError):
+        pass
 
 
 def serve(args):
@@ -315,13 +373,14 @@ def serve(args):
     if hasattr(signal, "SIGINT"):
         signal.signal(signal.SIGINT, stop)
     temp_root = tempfile.mkdtemp(prefix="nift-http-")
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen(args.backlog)
-    server.settimeout(0.2)
+    server = None
     handled = 0
     try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((args.host, args.port))
+        server.listen(args.backlog)
+        server.settimeout(0.2)
         while not state["stop"] and (args.max_requests == 0 or handled < args.max_requests):
             if os.getppid() != parent_pid:
                 break
@@ -332,26 +391,26 @@ def serve(args):
             handled += 1
             request_dir = os.path.join(temp_root, str(handled))
             os.mkdir(request_dir, 0o700)
-            method = "GET"
+            request_state = {"method": "GET"}
             with conn:
                 conn.settimeout(args.client_timeout_ms / 1000.0)
                 try:
-                    request, request_path = read_request(conn, address, args, handled, request_dir)
-                    method = request["method"]
+                    request, request_path = read_request(conn, address, args, handled, request_dir, request_state)
                     response = run_worker(args, request, request_path, request_dir, state)
                     status, headers, payload = response_parts(response)
-                    send_response(conn, status, payload, headers, method)
+                    safe_send_response(conn, status, payload, headers, request_state["method"])
                 except socket.timeout:
-                    send_response(conn, 408, "request timeout", method=method)
+                    safe_send_response(conn, 408, "request timeout", method=request_state["method"])
                 except HttpError as exc:
-                    send_response(conn, exc.status, exc.message, method=method)
-                except (BrokenPipeError, ConnectionResetError):
+                    safe_send_response(conn, exc.status, exc.message, method=request_state["method"])
+                except (BrokenPipeError, ConnectionResetError, UnicodeEncodeError):
                     pass
                 finally:
                     shutil.rmtree(request_dir, ignore_errors=True)
     finally:
         terminate_process(state["worker"])
-        server.close()
+        if server is not None:
+            server.close()
         shutil.rmtree(temp_root, ignore_errors=True)
     return 0
 

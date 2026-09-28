@@ -37,10 +37,18 @@ http.capabilities()
 `auto` selects `process` when Python 3 and the bundled helper are usable.
 Creating the first server freezes selection and pins the concrete backend into
 that server handle. `ffi` and `native` are reserved but are not advertised.
+If no process backend is usable, `http.server()` returns an error object with
+`ok: false` and `error_code: "backend_unavailable"`; no server resource is
+registered. The failed first-use attempt still freezes package selection.
 
 The process helper owns HTTP parsing and serialization. A fresh Nift application
 worker owns one request. Worker stdout is not protocol framing, so application
 `print()` calls cannot corrupt responses. See [PROTOCOL.md](PROTOCOL.md).
+
+Because each worker reruns the application script, top-level route registration
+must be deterministic and other top-level side effects run once per request.
+Move one-time side effects outside the application script or guard them when
+`NIFT_HTTP_WORKER == "1"`. This is a central v0.1 process-backend constraint.
 
 Routes support GET, POST, PUT, PATCH, DELETE and HEAD. `http.route()` accepts an
 additional method. Static segments and `:name` parameters are matched in Nift;
@@ -64,6 +72,6 @@ transfer encoding and duplicate Content-Length are rejected. JSON request
 bodies are decoded by the helper into `request.json`; malformed JSON receives
 400 without invoking application code.
 
-Current scope is plain HTTP/1.0 and HTTP/1.1 with `Connection: close`. TLS,
+Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
 streaming, multipart, WebSockets, persistent workers, FFI and native modules are
 deferred.
