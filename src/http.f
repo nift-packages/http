@@ -10,6 +10,7 @@ http_server_backends := map()
 http_server_configs := map()
 http_server_route_counts := map()
 http_server_routes := map()
+http_spool_paths := map()
 
 fn(http_helper_path()) {
     return pwd() + "/.nift/packages/http/helper/http_helper.py"
@@ -238,8 +239,66 @@ fn(http_dispatch(app, request)) {
     return response
 }
 
+fn(http_prepare_request(request)) {
+    if(request.has("_body_path")) {
+        body_token := request.request_id + ":body"
+        http_spool_paths.set(body_token, request._body_path)
+        request["body"] = {"kind":"spooled","size":request.body.size,"_body_id":body_token}
+    }
+    public_uploads := []
+    files := {}
+    if(request.has("_uploads")) {
+        for(raw_upload : request._uploads) {
+            upload_token := request.request_id + ":upload:" + raw_upload.id
+            http_spool_paths.set(upload_token, raw_upload.path)
+            upload := {
+                "kind":"upload",
+                "_upload_id":upload_token,
+                "name":raw_upload.field,
+                "filename":raw_upload.filename,
+                "content_type":raw_upload.content_type,
+                "size":raw_upload.size
+            }
+            public_uploads.push(upload)
+            field_key := raw_upload.field
+            if(files.has(field_key)) {
+                existing := files[field_key]
+                if(type(existing) == "array") {
+                    repeated := copy(existing)
+                    repeated.push(upload)
+                    files[field_key] = repeated
+                }
+                else { files[field_key] = [existing, upload] }
+            }
+            else { files[field_key] = upload }
+        }
+    }
+    request["uploads"] = public_uploads
+    request["files"] = files
+    return request.omit(["_body_path", "_uploads"])
+}
+
+fn(http_save_upload(upload, destination)) {
+    if(type(upload) != "object" || !upload.has("kind") || upload.kind != "upload" ||
+       !upload.has("_upload_id") || !http_spool_paths.contains(upload._upload_id)) {
+        return {"ok":false,"error":"invalid or expired upload handle","error_code":"invalid_upload","backend":"process"}
+    }
+    copy(http_spool_paths.get(upload._upload_id), destination)
+    return {"ok":true,"error":"","error_code":"","backend":"process"}
+}
+
+fn(http_save_body(body, destination)) {
+    if(type(body) != "object" || !body.has("kind") || body.kind != "spooled" ||
+       !body.has("_body_id") || !http_spool_paths.contains(body._body_id)) {
+        return {"ok":false,"error":"invalid or expired body handle","error_code":"invalid_body","backend":"process"}
+    }
+    copy(http_spool_paths.get(body._body_id), destination)
+    return {"ok":true,"error":"","error_code":"","backend":"process"}
+}
+
 fn(http_write_worker_response(app)) {
     request := inject(getenv("NIFT_HTTP_REQUEST"))
+    request = http_prepare_request(request)
     response := http_dispatch(app, request)
     envelope := {
         "protocol":1,
@@ -290,6 +349,13 @@ fn(http_listen(app)) {
     max_form_name_bytes := http_config_value(config, "max_form_name_bytes", 256)
     max_form_value_bytes := http_config_value(config, "max_form_value_bytes", 65536)
     max_cookie_pairs := http_config_value(config, "max_cookie_pairs", 128)
+    max_multipart_parts := http_config_value(config, "max_multipart_parts", 128)
+    max_multipart_files := http_config_value(config, "max_multipart_files", 32)
+    max_part_header_bytes := http_config_value(config, "max_part_header_bytes", 8192)
+    max_part_headers := http_config_value(config, "max_part_headers", 32)
+    max_file_bytes := http_config_value(config, "max_file_bytes", 1048576)
+    max_filename_bytes := http_config_value(config, "max_filename_bytes", 255)
+    max_temp_bytes := http_config_value(config, "max_temp_bytes", 2097152)
     backlog := http_config_value(config, "backlog", 16)
     result := run(
         http_python_path(), http_helper_path(),
@@ -309,6 +375,13 @@ fn(http_listen(app)) {
         "--max-form-name-bytes", max_form_name_bytes.to_string(),
         "--max-form-value-bytes", max_form_value_bytes.to_string(),
         "--max-cookie-pairs", max_cookie_pairs.to_string(),
+        "--max-multipart-parts", max_multipart_parts.to_string(),
+        "--max-multipart-files", max_multipart_files.to_string(),
+        "--max-part-header-bytes", max_part_header_bytes.to_string(),
+        "--max-part-headers", max_part_headers.to_string(),
+        "--max-file-bytes", max_file_bytes.to_string(),
+        "--max-filename-bytes", max_filename_bytes.to_string(),
+        "--max-temp-bytes", max_temp_bytes.to_string(),
         "--backlog", backlog.to_string()
     )
     if(!result.launched) {
@@ -336,6 +409,9 @@ fn(http_server_backend(app)) {
         "forms":true,
         "cookies":true,
         "binary_files":false,
+        "spooled_bodies":true,
+        "uploads":true,
+        "multipart":true,
         "streaming":false,
         "websockets":false,
         "tls":false,
@@ -353,6 +429,8 @@ fn(http_server_backend(app)) {
     text := (body, ...options) => http_text_response(body, options)
     json := (value, ...options) => http_json_response(value, options)
     cookie := (cookie_name, cookie_value, ...options) => http_cookie(cookie_name, cookie_value, options)
+    save_upload := (upload, destination) => http_save_upload(upload, destination)
+    save_body := (body, destination) => http_save_body(body, destination)
     listen := (app) => http_listen(app)
 }
 

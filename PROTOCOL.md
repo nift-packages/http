@@ -74,6 +74,28 @@ Structured response cookies are validated and serialized by the helper into
 one `Set-Cookie` field per descriptor. Raw `set-cookie` headers and structured
 cookies cannot be combined.
 
+Multipart request metadata is private until the package facade sanitizes it.
+The helper writes parts under generated request-owned names and supplies
+internal IDs/paths to the facade. Before a handler runs, the facade replaces
+them with upload descriptors:
+
+```json
+{
+  "kind": "upload",
+  "_upload_id": "request-logical-token",
+  "name": "attachment",
+  "filename": "client-name.bin",
+  "content_type": "application/octet-stream",
+  "size": 42
+}
+```
+
+No helper path reaches ordinary handler values. The token is valid only in that
+worker and is consumed through `http.save_upload()`. Generic binary request
+bodies similarly become a `spooled` body consumed by `http.save_body()`.
+Request cleanup always owns the original spool; saving copies it to the explicit
+application destination.
+
 ## Channel ownership
 
 Protocol framing never uses worker stdout or stderr. They are redirected to

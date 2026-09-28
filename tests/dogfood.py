@@ -92,7 +92,7 @@ source = f'''@import("http")
 app := http.server({{
     "host":"127.0.0.1",
     "port":{port},
-    "max_requests":38,
+    "max_requests":37,
     "max_request_line":256,
     "max_header_bytes":512,
     "max_headers":20,
@@ -235,8 +235,6 @@ try:
         raise AssertionError("duplicate Host was accepted")
     if raw_request(port, b"GET /%ZZ HTTP/1.1\r\nHost: x\r\n\r\n")[0] != 400:
         raise AssertionError("invalid path escape was accepted")
-    if raw_request(port, b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\n\xff")[0] != 415:
-        raise AssertionError("binary body was accepted as text")
     lower_method = raw_request(port, b"get / HTTP/1.1\r\nHost: x\r\n\r\n")
     if lower_method[0] != 405:
         raise AssertionError("lowercase HTTP method incorrectly matched GET")
@@ -261,7 +259,7 @@ if glob.glob(os.path.join(WORK, "tmp", "nift-http-*")):
 
 # A helper whose Nift parent is terminated must observe parent death and exit.
 shutdown_port = free_port()
-shutdown_source = source.replace(f'"port":{port}', f'"port":{shutdown_port}').replace('"max_requests":38', '"max_requests":0')
+shutdown_source = source.replace(f'"port":{port}', f'"port":{shutdown_port}').replace('"max_requests":37', '"max_requests":0')
 with open(os.path.join(WORK, "shutdown.f"), "w", encoding="utf-8") as output:
     output.write(shutdown_source)
 shutdown = subprocess.Popen([NIFT, "shutdown.f"], cwd=WORK, env=environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

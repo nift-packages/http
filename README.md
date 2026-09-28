@@ -99,6 +99,31 @@ bodies are decoded by the helper into `request.json`; malformed JSON receives
 Form-specific finite options are `max_form_fields`, `max_form_name_bytes` and
 `max_form_value_bytes`; `max_cookie_pairs` bounds parsed request cookies.
 
+Multipart requests populate `request.form`, `request.uploads` and
+`request.files`. A single file field is an upload object; repeated file fields
+become arrays. Upload objects contain only logical identity plus `name`,
+`filename`, `content_type` and `size`; client filenames are metadata and are
+never used as spool paths.
+
+```nift
+upload := request.files.attachment
+saved := http.save_upload(upload, "data/attachment.bin")
+```
+
+`save_upload` copies bytes to an application-chosen destination while the
+request is active. Arbitrary non-UTF-8 non-multipart bodies use an opaque
+`request.body` with `kind: "spooled"`; `http.save_body()` copies it. Handles
+expire when the one-shot worker exits, and helper-owned request files are then
+removed. Small UTF-8 text and JSON bodies retain their convenient buffered
+forms.
+
+Multipart limits include `max_multipart_parts`, `max_multipart_files`,
+`max_part_header_bytes`, `max_part_headers`, `max_file_bytes`,
+`max_filename_bytes` and `max_temp_bytes`. The aggregate `max_body_bytes` limit
+remains authoritative. The current helper parser is bounded but internally
+buffers the aggregate body before creating per-file spools; the public API does
+not depend on that implementation and remains compatible with later streaming.
+
 Current scope is plain HTTP/1.1 with `Connection: close`. TLS,
 streaming, multipart, WebSockets, persistent workers, FFI and native modules are
 deferred.

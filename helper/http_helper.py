@@ -201,6 +201,142 @@ def serialize_cookie(cookie):
     return "; ".join(parts)
 
 
+def parse_part_headers(block, args):
+    if len(block) > args.max_part_header_bytes:
+        raise HttpError(400, "multipart part headers are too large")
+    lines = block.split(b"\r\n") if block else []
+    if len(lines) > args.max_part_headers:
+        raise HttpError(400, "too many multipart part headers")
+    headers = {}
+    for line in lines:
+        if not line or line[:1] in (b" ", b"\t") or b":" not in line:
+            raise HttpError(400, "malformed multipart part header")
+        name, value = line.split(b":", 1)
+        if not TOKEN.fullmatch(name) or any(byte < 32 and byte != 9 for byte in value) or 127 in value:
+            raise HttpError(400, "invalid multipart part header")
+        key = name.decode("ascii").lower()
+        if key in headers:
+            raise HttpError(400, "duplicate multipart part header")
+        headers[key] = value.strip(b" \t").decode("latin-1")
+    if "content-transfer-encoding" in headers:
+        raise HttpError(400, "multipart transfer encoding is not supported")
+    return headers
+
+
+def next_multipart_boundary(body, marker, start):
+    position = start
+    while True:
+        position = body.find(marker, position)
+        if position == -1:
+            return -1
+        suffix = position + len(marker)
+        if body[suffix:suffix + 2] in (b"\r\n", b"--"):
+            return position
+        position += len(marker)
+
+
+def parse_disposition(value):
+    message = Message()
+    message["content-disposition"] = value
+    if message.get_content_disposition() != "form-data":
+        raise HttpError(400, "multipart part requires form-data disposition")
+    parameters = {}
+    for key, parameter in message.get_params(header="content-disposition")[1:]:
+        key = key.lower()
+        if key in parameters or parameter is None:
+            raise HttpError(400, "invalid multipart disposition parameters")
+        parameters[key] = parameter
+    field_name = parameters.get("name")
+    if not isinstance(field_name, str) or not field_name or any(ord(char) < 32 for char in field_name):
+        raise HttpError(400, "multipart part requires a valid name")
+    return field_name, parameters.get("filename"), "filename" in parameters
+
+
+def parse_multipart(body, parameters, request_dir, args):
+    boundary = parameters.get("boundary")
+    if not isinstance(boundary, str):
+        raise HttpError(400, "multipart boundary is required")
+    try:
+        encoded_boundary = boundary.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HttpError(400, "invalid multipart boundary") from exc
+    if not re.fullmatch(rb"[0-9A-Za-z'()+_,./:=?-]{1,70}", encoded_boundary):
+        raise HttpError(400, "invalid multipart boundary")
+    delimiter = b"--" + encoded_boundary
+    marker = b"\r\n" + delimiter
+    if not body.startswith(delimiter):
+        raise HttpError(400, "multipart body does not start with its boundary")
+    cursor = len(delimiter)
+    form = {}
+    uploads = []
+    part_count = 0
+    file_count = 0
+    spooled_bytes = len(body)
+    while True:
+        if body[cursor:cursor + 2] == b"--":
+            trailer = body[cursor + 2:]
+            if trailer not in (b"", b"\r\n"):
+                raise HttpError(400, "invalid multipart closing boundary")
+            break
+        if body[cursor:cursor + 2] != b"\r\n":
+            raise HttpError(400, "malformed multipart boundary")
+        header_start = cursor + 2
+        header_end = body.find(b"\r\n\r\n", header_start)
+        if header_end == -1:
+            raise HttpError(400, "multipart part headers are incomplete")
+        headers = parse_part_headers(body[header_start:header_end], args)
+        content_start = header_end + 4
+        boundary_position = next_multipart_boundary(body, marker, content_start)
+        if boundary_position == -1:
+            raise HttpError(400, "multipart closing boundary is missing")
+        content = body[content_start:boundary_position]
+        cursor = boundary_position + len(marker)
+        part_count += 1
+        if part_count > args.max_multipart_parts:
+            raise HttpError(413, "too many multipart parts")
+        if "content-disposition" not in headers:
+            raise HttpError(400, "multipart part has no content disposition")
+        if headers.get("content-type", "").lower().startswith("multipart/"):
+            raise HttpError(400, "nested multipart is not supported")
+        field_name, filename, has_filename = parse_disposition(headers["content-disposition"])
+        if len(field_name.encode("utf-8")) > args.max_form_name_bytes:
+            raise HttpError(400, "multipart field name is too large")
+        if has_filename:
+            file_count += 1
+            if file_count > args.max_multipart_files:
+                raise HttpError(413, "too many multipart files")
+            if not isinstance(filename, str) or any(char in filename for char in ("\x00", "\r", "\n")):
+                raise HttpError(400, "invalid multipart filename")
+            if len(filename.encode("utf-8")) > args.max_filename_bytes:
+                raise HttpError(400, "multipart filename is too large")
+            if len(content) > args.max_file_bytes:
+                raise HttpError(413, "multipart file is too large")
+            spooled_bytes += len(content)
+            if spooled_bytes > args.max_temp_bytes:
+                raise HttpError(413, "request temporary storage limit exceeded")
+            upload_id = str(file_count)
+            upload_path = os.path.join(request_dir, f"upload-{upload_id}.bin")
+            with open(upload_path, "wb") as output:
+                output.write(content)
+            uploads.append({
+                "id": upload_id,
+                "field": field_name,
+                "filename": filename,
+                "content_type": headers.get("content-type", "application/octet-stream"),
+                "size": len(content),
+                "path": upload_path,
+            })
+        else:
+            if len(content) > args.max_form_value_bytes:
+                raise HttpError(413, "multipart field is too large")
+            try:
+                value = content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HttpError(400, "multipart text field is not UTF-8") from exc
+            add_repeated(form, field_name, value)
+    return form, uploads
+
+
 def set_remaining_timeout(conn, deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -303,26 +439,38 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
     body_path = os.path.join(request_dir, "request.body")
     with open(body_path, "wb") as output:
         output.write(body)
+    if len(body) > args.max_temp_bytes:
+        raise HttpError(413, "request temporary storage limit exceeded")
 
     content_type, content_parameters = parse_content_type(headers.get("content-type", []))
     form = {}
+    uploads = []
     json_value = None
-    if content_type == "application/x-www-form-urlencoded":
+    private_body_path = None
+    if content_type == "multipart/form-data":
+        form, uploads = parse_multipart(bytes(body), content_parameters, request_dir, args)
+        body_value = {"kind": "multipart", "size": len(body)}
+    elif content_type == "application/x-www-form-urlencoded":
         form = parse_urlencoded(body, content_parameters, args)
         try:
             body_text = body.decode("ascii")
         except UnicodeDecodeError as exc:
             raise HttpError(400, "malformed URL-encoded form") from exc
+        body_value = {"kind": "text", "text": body_text}
     else:
         try:
             body_text = body.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise HttpError(415, "binary request bodies are not implemented") from exc
-    body_value = {"kind": "text", "text": body_text}
+            body_value = {"kind": "text", "text": body_text}
+        except UnicodeDecodeError:
+            body_text = None
+            body_value = {"kind": "spooled", "size": len(body)}
+            private_body_path = body_path
     if content_type == "application/json" or content_type.endswith("+json"):
         charset = content_parameters.get("charset", "utf-8").lower()
         if charset not in ("utf-8", "utf8"):
             raise HttpError(415, "JSON bodies require UTF-8")
+        if body_text is None:
+            raise HttpError(400, "JSON body is not UTF-8")
         try:
             json_value = json.loads(
                 body_text,
@@ -346,6 +494,10 @@ def read_request(conn, address, args, request_id, request_dir, request_state):
         "cookies": parse_cookies(headers.get("cookie", []), args.max_cookie_pairs),
         "remote_addr": address[0],
     }
+    if private_body_path is not None:
+        request["_body_path"] = private_body_path
+    if uploads:
+        request["_uploads"] = uploads
     request_path = os.path.join(request_dir, "request.json")
     with open(request_path, "w", encoding="utf-8") as output:
         json.dump(request, output, ensure_ascii=False, separators=(",", ":"))
@@ -592,6 +744,13 @@ def parse_args(argv):
     parser.add_argument("--max-form-name-bytes", type=int, default=256)
     parser.add_argument("--max-form-value-bytes", type=int, default=65536)
     parser.add_argument("--max-cookie-pairs", type=int, default=128)
+    parser.add_argument("--max-multipart-parts", type=int, default=128)
+    parser.add_argument("--max-multipart-files", type=int, default=32)
+    parser.add_argument("--max-part-header-bytes", type=int, default=8192)
+    parser.add_argument("--max-part-headers", type=int, default=32)
+    parser.add_argument("--max-file-bytes", type=int, default=1048576)
+    parser.add_argument("--max-filename-bytes", type=int, default=255)
+    parser.add_argument("--max-temp-bytes", type=int, default=2097152)
     parser.add_argument("--backlog", type=int, default=16)
     args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
@@ -599,7 +758,9 @@ def parse_args(argv):
     for name in ("max_requests", "worker_timeout_ms", "client_timeout_ms",
                   "max_request_line", "max_header_bytes", "max_headers",
                   "max_body_bytes", "max_form_fields", "max_form_name_bytes",
-                  "max_form_value_bytes", "max_cookie_pairs", "backlog"):
+                  "max_form_value_bytes", "max_cookie_pairs", "max_multipart_parts",
+                  "max_multipart_files", "max_part_header_bytes", "max_part_headers",
+                  "max_file_bytes", "max_filename_bytes", "max_temp_bytes", "backlog"):
         if getattr(args, name) < 0:
             parser.error(f"{name.replace('_', '-')} must not be negative")
     return args
