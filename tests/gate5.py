@@ -2,6 +2,7 @@
 """Gate 5 Linux streaming measurements for one-shot and persistent workers."""
 
 import glob
+import fcntl
 import json
 import os
 import shutil
@@ -119,6 +120,17 @@ def temp_usage():
                 except OSError:
                     pass
     return {"bytes": total, "files": files, "roots": roots}
+
+
+def fifo_capacity():
+    paths = glob.glob(os.path.join(TMP, "nift-http-*", "*", "response.pipe"))
+    if not paths:
+        return 0
+    descriptor = os.open(paths[0], os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        return fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
+    finally:
+        os.close(descriptor)
 
 
 def topology(parent, helper):
@@ -247,10 +259,12 @@ def measure_mode(mode):
         raise RuntimeError(f"{mode} bulk stream mismatch")
 
     slow = connect_request(port, "/slow", receive_buffer=4096)
+    slow_receive_buffer = slow.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     _headers, buffered = read_until(slow, b"\r\n\r\n")
     blocked_started = time.monotonic()
     time.sleep(1.0)
     blocked = topology(server.pid, helper)
+    blocked["fifo_capacity_bytes"] = fifo_capacity()
     marker_absent = not os.path.exists(marker)
     bounded = (
         marker_absent
@@ -260,6 +274,7 @@ def measure_mode(mode):
         and blocked["topology_rss_kib"] <= idle["topology_rss_kib"] + 32768
         and blocked["topology_processes"] <= idle["topology_processes"] + 1
         and blocked["temporary_storage"]["bytes"] < 1048576
+        and 0 < blocked["fifo_capacity_bytes"] < 1048576
     )
     if not bounded:
         raise RuntimeError(f"{mode} slow-reader resources were not bounded: {blocked!r}")
@@ -309,6 +324,7 @@ def measure_mode(mode):
             "observation_ms": round((disconnected - blocked_started) * 1000, 3),
             "bounded": bounded,
             "producer_completion_marker_absent": marker_absent,
+            "client_receive_buffer_bytes": slow_receive_buffer,
             "disconnect_cleanup_ms": round(disconnect_cleanup_ms, 3),
             "recovery_succeeded": True,
         },
