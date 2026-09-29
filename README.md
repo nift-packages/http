@@ -2,6 +2,7 @@
 
 Backend-neutral HTTP server package for Nift. Version 0.1.0 currently provides
 a process backend with facade-managed routing.
+This named-method package version requires Nift 4.6.0 or newer.
 
 ```nift
 @import("http")
@@ -24,6 +25,9 @@ The server handle is package data and all stateful behavior remains on the
 `http` facade. `listen()` blocks until shutdown. For deterministic tests,
 `max_requests` may stop the helper after a finite number of accepted requests.
 `http.server_backend(app)` reports the concrete backend pinned to that server.
+Facade operations are named methods. They must be called through a facade
+instance; extracting an operation such as `handler := http.text` as a
+first-class member is intentionally unsupported.
 
 Backend inspection follows the package convention:
 
