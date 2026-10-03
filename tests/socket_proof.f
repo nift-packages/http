@@ -44,7 +44,7 @@ rb := ffi_buffer(zeros(16))
 r := ffi_call(lib, "recv", "i64(i64,buffer,i64,i32)", accepted, rb, 16, 0)
 rd := ffi_bytes(rb)
 if(r != 3 || rd[0] != 72 || rd[1] != 105 || rd[2] != 33) { fail("recv roundtrip") }
-if(os() == "windows") { ffi_call(lib, "closesocket", "i32(i64)", accepted); ffi_call(lib, "closesocket", "i32(i64)", client); ffi_call(lib, "closesocket", "i32(i64)", listener); ffi_call(lib, "WSACleanup", "i32()", 0) }
+if(os() == "windows") { ffi_call(lib, "closesocket", "i32(i64)", accepted); ffi_call(lib, "closesocket", "i32(i64)", client); ffi_call(lib, "closesocket", "i32(i64)", listener); ffi_call(lib, "WSACleanup", "i32()") }
 else { ffi_call(lib, "close", "i32(i64)", accepted); ffi_call(lib, "close", "i32(i64)", client); ffi_call(lib, "close", "i32(i64)", listener) }
 print("PASS socket proof (port " + port.to_string() + ")")
 if(fails > 0) { print("FAILED " + fails.to_string()) }
