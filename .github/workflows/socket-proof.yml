@@ -1,0 +1,56 @@
+name: socket proof (experimental SERVER0)
+
+# EXPERIMENTAL throwaway proof-of-concept for the Python-free HTTP server
+# feasibility audit (SERVER0). Builds nift-dev/nift main and runs
+# tests/socket_proof.f, which opens a localhost listener, connects a client,
+# exchanges bytes and closes cleanly using only the current Nift FFI against
+# libc/libSystem/ws2_32. This is NOT the production server and must not be
+# treated as package CI.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  proof:
+    name: ${{ matrix.os }} socket proof
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: http
+      - uses: actions/checkout@v5
+        with:
+          repository: nift-dev/nift
+          ref: main
+          path: nift
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-winpthreads
+      - name: Build Nift
+        if: runner.os != 'Windows'
+        run: make -C nift -j2
+      - name: Build Nift on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make -C nift -j2
+      - name: Run socket proof
+        if: runner.os != 'Windows'
+        run: |
+          "$PWD/nift/nift" http/tests/socket_proof.f
+          "$PWD/nift/nift" http/tests/socket_proof.f | grep -q 'PASS socket proof' || exit 1
+      - name: Run socket proof on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          "$PWD/nift/nift.exe" http/tests/socket_proof.f
+          "$PWD/nift/nift.exe" http/tests/socket_proof.f | grep -q 'PASS socket proof' || exit 1
