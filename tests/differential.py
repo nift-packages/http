@@ -70,8 +70,8 @@ def launch(backend, port):
                             text=True, env=env)
     time.sleep(2.5)
     if proc.poll() is not None:
-        raise SystemExit(f"{backend} server exited early: "
-                         f"{proc.stdout.read() if proc.stdout else ''}")
+        out = proc.stdout.read() if proc.stdout else ""
+        raise SystemExit(f"{backend} server exited early: rc={proc.returncode} out={out!r}")
     return proc
 
 
