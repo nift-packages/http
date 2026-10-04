@@ -70,7 +70,7 @@ if process.returncode != 0:
     raise SystemExit(f"FAIL app exited {process.returncode}\nstdout={stdout}\nstderr={stderr}")
 if not response.startswith(b"HTTP/1.1 404 ") or not response.endswith(b"not found"):
     raise SystemExit(f"FAIL unexpected bootstrap response: {response!r} stdout={stdout!r} stderr={stderr!r}")
-if stdout.strip().splitlines() != ["process", "process", "backend_locked", "true"]:
+if stdout.strip().splitlines() != ["process,native", "process", "backend_locked", "true"]:
     raise SystemExit(f"FAIL facade contract: {stdout!r} stderr={stderr!r}")
 
 private_source = '@import("http")\nprint(http_helper_path())\n'

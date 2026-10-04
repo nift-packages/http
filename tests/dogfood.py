@@ -292,13 +292,16 @@ if glob.glob(os.path.join(WORK, "tmp", "nift-http-*")):
     raise SystemExit("FAIL helper temporary root leaked after bind failure")
 
 # Disabled process execution is unavailable before launch and remains pinned.
+# With process execution disabled the native backend is still available, so
+# the package keeps working: backends() reports native, auto resolves to it,
+# and server()/listen() succeed. Process-specific failures still surface.
 disabled_source = '''@import("http")
 print(http.backends().size())
+print(http.use_backend("process").error_code)
+print(http.use_backend("ffi").error_code)
 app := http.server({"port":8080})
 print(http.backend())
 print(http.server_backend(app))
-print(app.error_code)
-print(http.listen(app).error_code)
 '''
 with open(os.path.join(WORK, "disabled.f"), "w", encoding="utf-8") as output:
     output.write(disabled_source)
@@ -306,7 +309,7 @@ disabled = subprocess.run(
     [NIFT, "disabled.f"], cwd=WORK,
     env=environment({"NIFT_NO_PROCESS": "1"}), capture_output=True, text=True,
 )
-if disabled.returncode != 0 or disabled.stdout.strip().splitlines() != ["0", "null", "null", "backend_unavailable", "backend_unavailable"]:
+if disabled.returncode != 0 or disabled.stdout.strip().splitlines() != ["1", "backend_unavailable", "backend_unavailable", "native", "native"]:
     raise SystemExit(f"FAIL disabled backend contract: {disabled.stdout!r} {disabled.stderr!r}")
 
 print("PASS http CP06 dogfood")

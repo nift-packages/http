@@ -38,7 +38,7 @@ actual_signatures = dict(re.findall(
 ))
 if actual_signatures != expected_signatures or len(public_methods) != 23:
     raise SystemExit(f"FAIL public method surface: {public_methods!r}")
-if len(private_methods) != 20:
+if len(private_methods) != 47:
     raise SystemExit(f"FAIL private method count: {private_methods!r}")
 if re.search(r"^    (?:private )?fn\(http_", package_source, re.MULTILINE):
     raise SystemExit("FAIL legacy module helper remains")
@@ -77,7 +77,7 @@ facade_source = f'''@import("http")
 fn(expect(condition, label)) {{ if(!condition) {{ print("FAIL " + label); missing.value }} }}
 
 expect(http.available(), "available")
-expect(http.backends().stringify() == "[\\"process\\"]", "backends")
+expect(http.backends().stringify() == "[\\\"process\\\",\\\"native\\\"]", "backends")
 expect(http.backend() == "process", "backend")
 expect(http.use_backend("auto").ok, "use_backend")
 caps := http.capabilities()
