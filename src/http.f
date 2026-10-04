@@ -1283,7 +1283,7 @@ struct(http) {
         } catch(e) {
             out = this.native_error_bytes(500, "response serialization failed")
         }
-        http_native_states.set(state_key, {"stage":"sending","pending":out,"offset":0,"last":epoch()})
+        http_native_states.set(state_key, {"stage":"sending","pending":out,"offset":0,"last":epoch(),"start":epoch()})
         return {"action":"keep"}
     }
 
@@ -1430,7 +1430,7 @@ struct(http) {
                         stall := false
                         if(http_native_states.contains(stk)) {
                             st2 := http_native_states.get(stk)
-                            if(st2.stage == "sending" && epoch() - st2.get("last") > client_timeout) { stall = true }
+                            if(st2.stage == "sending" && epoch() - st2.get("start") > client_timeout) { stall = true }
                         }
                         if(stall) {
                             socket.close(a.handle)
@@ -1444,6 +1444,7 @@ struct(http) {
                     if(http_native_states.contains(state_key)) {
                         st := http_native_states.get(state_key)
                         age := epoch() - st.get("last")
+                        if(st.stage == "sending" && epoch() - st.get("start") > client_timeout) { age = client_timeout + 1 }
                         if(age > client_timeout) {
                             if(st.stage == "reading") {
                                 socket.send_all(a.handle, bytes(this.native_error_bytes(408, "request timeout")))
