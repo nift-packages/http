@@ -1,0 +1,68 @@
+name: native http (SERVER2)
+
+# Runs the opt-in native HTTP backend (socket package facade only) on
+# Linux/macOS/Windows through the real http -> socket transitive dependency.
+# Python is used strictly as the test driver; the native backend never invokes
+# Python. The process backend is exercised by the differential harness as the
+# behavioral oracle.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  native:
+    name: ${{ matrix.os }} native http
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: http
+      - uses: actions/checkout@v5
+        with:
+          repository: nift-dev/nift
+          ref: main
+          path: nift
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-winpthreads
+      - name: Build Nift
+        if: runner.os != 'Windows'
+        run: make -C nift -j2
+      - name: Build Nift on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make -C nift -j2
+
+      - name: Native backend harness (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          python3 http/tests/native_test.py "$PWD/nift/nift" "$PWD/http" | tee native.log
+          grep -q 'native harness: 24 passed, 0 failed' native.log
+      - name: Native backend harness (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          python http/tests/native_test.py "$PWD/nift/nift.exe" "$PWD/http" | tee native.log
+          grep -q 'native harness: 24 passed, 0 failed' native.log
+
+      - name: Differential process-vs-native (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          python3 http/tests/differential.py "$PWD/nift/nift" "$PWD/http" | tee diff.log
+          grep -q 'differential: 10 passed, 0 failed' diff.log
+      - name: Differential process-vs-native (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          python http/tests/differential.py "$PWD/nift/nift.exe" "$PWD/http" | tee diff.log
+          grep -q 'differential: 10 passed, 0 failed' diff.log
