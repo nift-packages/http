@@ -262,8 +262,6 @@ def main():
 
     # slowloris timeout reaping: incomplete request gets 408, server survives
     port3 = free_port()
-    proc3, _ = launch(port3, max_requests=0)
-    proc3.kill(); proc3.wait()
     project = os.path.join(WORK, f"t{port3}")
     os.makedirs(os.path.join(project, ".nift"), exist_ok=True)
     subprocess.run([NIFT, "add", PKG], cwd=project, capture_output=True, text=True, timeout=120, check=True)
