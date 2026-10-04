@@ -1156,7 +1156,7 @@ struct(http) {
             sr := socket.send_all(conn, bytes(chunk))
             if(!sr.ok) {
                 st["offset"] = offset + sr.sent
-                st["last"] = epoch()
+                if(sr.sent >= chunk_count) { st["last"] = epoch() }
                 http_native_states.set(state_key, st)
                 return {"action":"keep"}
             }
@@ -1334,7 +1334,18 @@ struct(http) {
                         if(max_requests > 0 && served >= max_requests) { done = true }
                     }
                     if(result.action == "keep") {
-                        next_active.push({"handle":a.handle,"fd":fd})
+                        stk := key
+                        stall := false
+                        if(http_native_states.contains(stk)) {
+                            st2 := http_native_states.get(stk)
+                            if(st2.stage == "sending" && epoch() - st2.get("last") > client_timeout) { stall = true }
+                        }
+                        if(stall) {
+                            socket.close(a.handle)
+                            http_native_states.remove(stk)
+                        } else {
+                            next_active.push({"handle":a.handle,"fd":fd})
+                        }
                     }
                 } else {
                     state_key := fd.to_string()
