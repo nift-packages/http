@@ -51,7 +51,8 @@ http.get(app, "/query", (request) => http.text(request.query.has("q") ? request.
 http.get(app, "/json", (request) => http.json({{"message":"ok","n":5,"arr":[1,2,3]}}))
 http.post(app, "/echo", (request) => {{ b := request.body; t := ""; if(type(b) == "object" && b.has("text")) {{ t = b.text }}; return http.text("echo:" + t) }})
 http.get(app, "/empty", (request) => http.text("", {{"status":204}}))
-http.listen(app)
+r := http.listen(app)
+print("listen:" + r.ok.to_string() + ":" + r.error + ":" + r.error_code)
 '''
 
 
