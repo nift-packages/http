@@ -827,26 +827,28 @@ struct(http) {
                 j += 1
             }
             if(colon <= 0) { return {"ok":false,"status":400,"headers":null,"length":0} }
-            name_arr := this.native_slice(line, 0, colon)
-            value_arr := this.native_slice(line, colon + 1, line.size() - colon - 1)
-            j = 0
-            while(j < name_arr.size()) { if(!this.native_is_token_char(name_arr[j])) { return {"ok":false,"status":400,"headers":null,"length":0} } j += 1 }
             lower_name := []
             j = 0
-            while(j < name_arr.size()) { lower_name.push(this.native_ascii_lower(name_arr[j])); j += 1 }
+            while(j < colon) {
+                c := line[j]
+                if(!this.native_is_token_char(c)) { return {"ok":false,"status":400,"headers":null,"length":0} }
+                lower_name.push(this.native_ascii_lower(c))
+                j += 1
+            }
             header_name := bytes(lower_name).decode("utf-8")
-            vs := 0
-            ve := value_arr.size()
-            while(vs < ve && (value_arr[vs] == 32 || value_arr[vs] == 9)) { vs += 1 }
-            while(ve > vs && (value_arr[ve - 1] == 32 || value_arr[ve - 1] == 9)) { ve -= 1 }
-            j = vs
-            while(j < ve) {
-                c := value_arr[j]
+            vs := colon + 1
+            ve := line.size()
+            while(vs < ve && (line[vs] == 32 || line[vs] == 9)) { vs += 1 }
+            while(ve > vs && (line[ve - 1] == 32 || line[ve - 1] == 9)) { ve -= 1 }
+            value_slice := this.native_slice(line, vs, ve - vs)
+            j = 0
+            while(j < value_slice.size()) {
+                c := value_slice[j]
                 if((c < 32 && c != 9) || c == 127) { return {"ok":false,"status":400,"headers":null,"length":0} }
                 j += 1
             }
-            if(!this.native_valid_utf8(this.native_slice(value_arr, vs, ve - vs))) { return {"ok":false,"status":400,"headers":null,"length":0} }
-            val := bytes(this.native_slice(value_arr, vs, ve - vs)).decode("utf-8")
+            if(!this.native_valid_utf8(value_slice)) { return {"ok":false,"status":400,"headers":null,"length":0} }
+            val := bytes(value_slice).decode("utf-8")
             if(headers.has(header_name)) {
                 existing := headers[header_name]
                 existing.push(val)
@@ -1170,7 +1172,7 @@ struct(http) {
             return {"action":"keep"}
         }
         buf := st["buf"]
-        rr := socket.recv(conn, 65536)
+        rr := socket.recv(conn, 16384)
         if(rr.eof) {
             socket.close(conn)
             http_native_states.remove(state_key)
@@ -1272,6 +1274,7 @@ struct(http) {
         max_requests := this.native_config(config, "max_requests", 0)
         client_timeout := this.native_config(config, "client_timeout_ms", 10000)
         max_concurrency := this.native_config(config, "max_concurrency", 16)
+        poll_timeout := this.native_config(config, "poll_timeout_ms", 10)
         if(os() == "windows" && max_concurrency > 63) { max_concurrency = 63 }
         listener := socket.listen({"host":host,"port":port,"backlog":backlog})
         if(!listener.ok) {
@@ -1284,7 +1287,7 @@ struct(http) {
             poll_items := []
             poll_items.push(listener.handle)
             for(a : active) { poll_items.push(a.handle) }
-            pr := socket.poll(poll_items, 50)
+            pr := socket.poll(poll_items, poll_timeout)
             if(!pr.ok) {
                 for(a : active) { socket.close(a.handle) }
                 socket.close(listener.handle)
