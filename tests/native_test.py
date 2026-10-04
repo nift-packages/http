@@ -60,6 +60,7 @@ http.get(app, "/json", (request) => http.json({{"message":"ok","n":5,"arr":[1,2,
 http.get(app, "/cookies", (request) => http.text("c", {{"cookies":[http.cookie("a","1"), http.cookie("b","2")]}}))
 http.post(app, "/echo", (request) => {{ b := request.body; t := ""; if(type(b) == "object" && b.has("text")) {{ t = b.text }}; return http.text("echo:" + t) }})
 http.get(app, "/empty", (request) => http.text("", {{"status":204}}))
+http.get(app, "/big", (request) => {{ s := ""; i := 0; chunk := "0123456789ABCDEF"; while(i < 8192) {{ s += chunk; i += 1 }}; return http.text(s) }})
 http.listen(app)
 '''
     src = os.path.join(project, "srv.f")
@@ -146,6 +147,11 @@ def main():
         r = client("GET", "/empty")
         report("204 no body", r["status"] == 204 and r["body"] == b""
                and "content-length" not in r["headers"], str(r))
+
+        r = client("GET", "/big")
+        report("large response send-continuation", r["status"] == 200
+               and len(r["body"]) == 131072 and r["body"] == b"0123456789ABCDEF" * 8192
+               and r["headers"].get("content-length") == "131072", str((r["status"], len(r["body"]))))
 
         r = client("GET", "/nope")
         report("404 route", r["status"] == 404, str(r))
@@ -253,6 +259,40 @@ def main():
     finally:
         proc2.kill()
         proc2.wait()
+
+    # slowloris timeout reaping: incomplete request gets 408, server survives
+    port3 = free_port()
+    proc3, _ = launch(port3, max_requests=0)
+    proc3.kill(); proc3.wait()
+    project = os.path.join(WORK, f"t{port3}")
+    os.makedirs(os.path.join(project, ".nift"), exist_ok=True)
+    subprocess.run([NIFT, "add", PKG], cwd=project, capture_output=True, text=True, timeout=120, check=True)
+    app3 = f'''
+@import("http")
+http.use_backend("native")
+app := http.server({{"host":"127.0.0.1","port":{port3},"client_timeout_ms":500}})
+http.get(app, "/", (request) => http.text("ok"))
+http.listen(app)
+'''
+    with open(os.path.join(project, "srv.f"), "w", encoding="utf-8") as handle:
+        handle.write(app3)
+    proc3 = subprocess.Popen([NIFT, "srv.f"], cwd=project, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2.0)
+    conn = socket.create_connection(("127.0.0.1", port3), timeout=5)
+    conn.settimeout(5)
+    conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")
+    data = b""
+    try:
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except socket.timeout:
+        pass
+    conn.close()
+    report("slowloris timeout 408", data.startswith(b"HTTP/1.1 408 "), str(data[:40]))
+    proc3.kill(); proc3.wait()
 
     shutil.rmtree(WORK, ignore_errors=True)
     print(f"native harness: {PASS} passed, {len(FAILS)} failed")

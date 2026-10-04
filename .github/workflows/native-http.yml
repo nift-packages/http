@@ -47,22 +47,22 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           python3 http/tests/native_test.py "$PWD/nift/nift" "$PWD/http" | tee native.log
-          grep -q 'native harness: 24 passed, 0 failed' native.log
+          grep -q 'native harness: 26 passed, 0 failed' native.log
       - name: Native backend harness (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           python http/tests/native_test.py "$PWD/nift/nift.exe" "$PWD/http" | tee native.log
-          grep -q 'native harness: 24 passed, 0 failed' native.log
+          grep -q 'native harness: 26 passed, 0 failed' native.log
 
       - name: Differential process-vs-native (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           python3 http/tests/differential.py "$PWD/nift/nift" "$PWD/http" | tee diff.log
-          grep -q 'differential: 10 passed, 0 failed' diff.log
+          grep -q 'differential: 12 passed, 0 failed' diff.log
       - name: Differential process-vs-native (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           python http/tests/differential.py "$PWD/nift/nift.exe" "$PWD/http" | tee diff.log
-          grep -q 'differential: 10 passed, 0 failed' diff.log
+          grep -q 'differential: 12 passed, 0 failed' diff.log

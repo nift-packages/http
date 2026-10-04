@@ -95,6 +95,8 @@ def main():
     cases = [
         ("GET", "/hello/world"),
         ("GET", "/hello/foo%20bar"),
+        ("GET", "/hello/a+b"),
+        ("GET", "/hello/a%2Fb"),
         ("GET", "/query?q=alpha%20beta"),
         ("GET", "/query"),
         ("GET", "/json"),
