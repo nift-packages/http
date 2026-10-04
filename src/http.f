@@ -21,6 +21,8 @@ http_worker_request_id := ""
 http_worker_request_method := ""
 http_worker_stream_published := false
 http_native_states := map()
+http_native_parse_lib := ""
+http_native_parse_outbuf := ""
 
 struct(http) {
     private fn(helper_path()) {
@@ -1207,26 +1209,45 @@ struct(http) {
             http_native_states.remove(state_key)
             return {"action":"close"}
         }
-        lines := this.native_split_crlf(header_arr)
-        if(lines.size() == 0) {
-            socket.send_all(conn, bytes(this.native_error_bytes(400, "bad request")))
-            socket.close(conn)
-            http_native_states.remove(state_key)
-            return {"action":"close"}
-        }
-        rl := this.native_parse_request_line(lines[0], max_request_line)
-        if(!rl.ok) {
-            socket.send_all(conn, bytes(this.native_error_bytes(rl.status, "bad request")))
-            socket.close(conn)
-            http_native_states.remove(state_key)
-            return {"action":"close"}
-        }
-        hp := this.native_parse_headers(lines, max_headers, max_body_bytes)
-        if(!hp.ok) {
-            socket.send_all(conn, bytes(this.native_error_bytes(hp.status, "bad request")))
-            socket.close(conn)
-            http_native_states.remove(state_key)
-            return {"action":"close"}
+        rl := {"ok":false}
+        hp := {"ok":false}
+        if(http_native_parse_lib != "") {
+            rp := this.native_ffi_parse_head(http_native_parse_lib, http_native_parse_outbuf, this.native_slice(buf, 0, term + 4), max_headers, max_body_bytes)
+            if(rp.ok) {
+                rl = {"ok":true,"method":rp.method,"target":rp.target,"version":"HTTP/1.1"}
+                hp = {"ok":true,"status":200,"headers":rp.headers,"length":rp.length}
+            } else {
+                if(rp.status == 431 || rp.status == 413 || rp.status == 501 || rp.status == 414) {
+                    socket.send_all(conn, bytes(this.native_error_bytes(rp.status, "bad request")))
+                } else {
+                    socket.send_all(conn, bytes(this.native_error_bytes(400, "bad request")))
+                }
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"close"}
+            }
+        } else {
+            lines := this.native_split_crlf(header_arr)
+            if(lines.size() == 0) {
+                socket.send_all(conn, bytes(this.native_error_bytes(400, "bad request")))
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"close"}
+            }
+            rl = this.native_parse_request_line(lines[0], max_request_line)
+            if(!rl.ok) {
+                socket.send_all(conn, bytes(this.native_error_bytes(rl.status, "bad request")))
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"close"}
+            }
+            hp = this.native_parse_headers(lines, max_headers, max_body_bytes)
+            if(!hp.ok) {
+                socket.send_all(conn, bytes(this.native_error_bytes(hp.status, "bad request")))
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"close"}
+            }
         }
         if(hp.length > max_body_bytes) {
             socket.send_all(conn, bytes(this.native_error_bytes(413, "request body is too large")))
@@ -1266,6 +1287,76 @@ struct(http) {
         return {"action":"keep"}
     }
 
+    private fn(native_bdecode(arr)) {
+        return bytes(arr).decode("utf-8")
+    }
+
+    private fn(native_ffi_u32(b, p)) {
+        a := b[p]
+        e := b[p + 1]
+        f := b[p + 2]
+        g := b[p + 3]
+        return a + (e * 256) + (f * 65536) + (g * 16777216)
+    }
+
+    private fn(native_ffi_parse_head(lib, outbuf, head, max_headers, max_body_bytes)) {
+        hb := bytes(head)
+        hbuf := ffi_buffer(hb)
+        nn := ffi_call(lib, "http_parse", "i32(buffer,i32,buffer,i32)", hbuf, hb.length(), outbuf, 2048)
+        if(nn <= 0) { return {"ok":false,"status":400} }
+        out := this.native_bytes_to_array(ffi_bytes(outbuf))
+        status := this.native_ffi_u32(out, 0)
+        if(status != 200) { return {"ok":false,"status":status} }
+        ml := this.native_ffi_u32(out, 4)
+        ms := this.native_slice(out, 8, ml)
+        method := this.native_bdecode(ms)
+        tl := this.native_ffi_u32(out, 8 + ml)
+        ts := this.native_slice(out, 12 + ml, tl)
+        target := this.native_bdecode(ts)
+        vp := 12 + ml + tl
+        vl := this.native_ffi_u32(out, vp)
+        vp = vp + 4 + vl
+        hc := this.native_ffi_u32(out, vp)
+        vp = vp + 4
+        if(hc > max_headers) { return {"ok":false,"status":431} }
+        headers := {}
+        i := 0
+        while(i < hc) {
+            nl := this.native_ffi_u32(out, vp)
+            ns := this.native_slice(out, vp + 4, nl)
+            name := this.native_bdecode(ns)
+            vp = vp + 4 + nl
+            nvl := this.native_ffi_u32(out, vp)
+            vs := this.native_slice(out, vp + 4, nvl)
+            val := this.native_bdecode(vs)
+            vp = vp + 4 + nvl
+            headers[name] = [val]
+            i += 1
+        }
+        cl := 0
+        k := 0
+        while(k < 8) {
+            bb := out[vp + k]
+            mult := 1
+            m := 0
+            while(m < k) { mult = mult * 256; m += 1 }
+            cl = cl + (bb * mult)
+            k += 1
+        }
+        if(cl > max_body_bytes) { return {"ok":false,"status":413} }
+        return {"ok":true,"status":200,"method":method,"target":target,"headers":headers,"length":cl}
+    }
+
+    private fn(native_load_parser(config)) {
+        lib_path := this.native_config(config, "native_parser_lib", "")
+        if(lib_path == "" || !exists(lib_path)) { return }
+        http_native_parse_lib = ffi_open(lib_path)
+        zarr := []
+        zi := 0
+        while(zi < 2048) { zarr.push(0); zi += 1 }
+        http_native_parse_outbuf = ffi_buffer(bytes(zarr))
+    }
+
     private fn(native_listen(app)) {
         config := http_server_configs.get(app._server_id)
         host := this.native_config(config, "host", "127.0.0.1")
@@ -1274,7 +1365,8 @@ struct(http) {
         max_requests := this.native_config(config, "max_requests", 0)
         client_timeout := this.native_config(config, "client_timeout_ms", 10000)
         max_concurrency := this.native_config(config, "max_concurrency", 16)
-        poll_timeout := this.native_config(config, "poll_timeout_ms", 10)
+        poll_timeout := this.native_config(config, "poll_timeout_ms", 50)
+        this.native_load_parser(config)
         if(os() == "windows" && max_concurrency > 63) { max_concurrency = 63 }
         listener := socket.listen({"host":host,"port":port,"backlog":backlog})
         if(!listener.ok) {
