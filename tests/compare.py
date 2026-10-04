@@ -55,7 +55,7 @@ def tree_stats(pid):
     return total_rss, n
 
 
-def launch(label, backend, port, conc, wmode, wpool):
+def launch(label, backend, port, conc, wmode, wpool, nat_lib):
     project = os.path.join(WORK, f"{label}{port}")
     os.makedirs(os.path.join(project, ".nift"), exist_ok=True)
     env = dict(os.environ)
@@ -65,7 +65,7 @@ def launch(label, backend, port, conc, wmode, wpool):
     app = f'''
 @import("http")
 http.use_backend("{backend}")
-app := http.server({{"host":"127.0.0.1","port":{port},"max_requests":0,"max_concurrency":{conc},"worker_mode":"{wmode}","worker_pool_size":{wpool},"poll_timeout_ms":50}})
+app := http.server({{"host":"127.0.0.1","port":{port},"max_requests":0,"max_concurrency":{conc},"worker_mode":"{wmode}","worker_pool_size":{wpool},"poll_timeout_ms":50,"native_parser_lib":"{nat_lib}"}})
 http.get(app, "/text", (request) => http.text("hello-benchmark-0123456789"))
 http.get(app, "/json/:id", (request) => http.json({{"id":request.params.id,"ok":true}}))
 http.post(app, "/echo", (request) => {{ b := request.body; t := ""; if(type(b) == "object" && b.has("text")) {{ t = b.text }}; return http.text(t) }})
@@ -130,9 +130,9 @@ def run_load(port, concurrency, duration, path, method="GET", body=None):
 
 def main():
     configs = [
-        ("native", "native", 16, "oneshot", 1),
-        ("process_default", "process", 1, "oneshot", 1),
-        ("process_persistent", "process", 4, "persistent", 4),
+        ("native", "native", 16, "oneshot", 1, "/tmp/opencode/libnative_parse.so"),
+        ("process_default", "process", 1, "oneshot", 1, ""),
+        ("process_persistent", "process", 4, "persistent", 4, ""),
     ]
     workloads = [
         ("text", "GET", "/text", None),
@@ -141,11 +141,11 @@ def main():
         ("large", "GET", "/large", None),
     ]
     print(f"{'config':<18}{'wl':<8}{'c':>3} {'req/s':>8} {'p50':>8} {'p95':>8}")
-    for label, backend, conc, wmode, wpool in configs:
+    for label, backend, conc, wmode, wpool, nat_lib in configs:
         port = free_port()
         proc = None
         for attempt in range(6):
-            proc, _ = launch(label, backend, port, conc, wmode, wpool)
+            proc, _ = launch(label, backend, port, conc, wmode, wpool, nat_lib)
             time.sleep(2.5)
             if health(port) and proc.poll() is None:
                 break

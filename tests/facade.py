@@ -38,7 +38,7 @@ actual_signatures = dict(re.findall(
 ))
 if actual_signatures != expected_signatures or len(public_methods) != 23:
     raise SystemExit(f"FAIL public method surface: {public_methods!r}")
-if len(private_methods) != 47:
+if len(private_methods) != 51:
     raise SystemExit(f"FAIL private method count: {private_methods!r}")
 if re.search(r"^    (?:private )?fn\(http_", package_source, re.MULTILINE):
     raise SystemExit("FAIL legacy module helper remains")
