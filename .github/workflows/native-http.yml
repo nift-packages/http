@@ -63,6 +63,8 @@ jobs:
       - name: Differential process-vs-native (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
+        env:
+          NIFT_HTTP_PYTHON: python
         run: |
           python http/tests/differential.py "$PWD/nift/nift.exe" "$PWD/http" | tee diff.log
           grep -q 'differential: 12 passed, 0 failed' diff.log
