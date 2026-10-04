@@ -732,7 +732,7 @@ struct(http) {
         return 0
     }
 
-    private fn(native_percent_decode(str)) {
+    private fn(native_unquote(str, plus_as_space)) {
         b := str.encode("utf-8")
         out := []
         i := 0
@@ -740,17 +740,19 @@ struct(http) {
         while(i < n) {
             code := b[i]
             pushed := false
-            if(code == 43) { out.push(32); i += 1; pushed = true }
+            if(code == 43 && plus_as_space) { out.push(32); i += 1; pushed = true }
             if(!pushed && code == 37 && i + 2 < n) {
                 c1 := b[i + 1]
                 c2 := b[i + 2]
                 h1ok := (c1 >= 48 && c1 <= 57) || (c1 >= 97 && c1 <= 102) || (c1 >= 65 && c1 <= 70)
                 h2ok := (c2 >= 48 && c2 <= 57) || (c2 >= 97 && c2 <= 102) || (c2 >= 65 && c2 <= 70)
-                if(h1ok && h2ok) { out.push(this.native_hex_val(c1) * 16 + this.native_hex_val(c2)); i += 3 }
-                if(h1ok && h2ok) { pushed = true }
-                if(!pushed) { out.push(code); i += 1 }
+                if(h1ok && h2ok) { out.push(this.native_hex_val(c1) * 16 + this.native_hex_val(c2)); i += 3; pushed = true }
             }
-            if(!pushed) { out.push(code); i += 1 }
+            if(!pushed) {
+                if(code == 37) { return null }
+                out.push(code)
+                i += 1
+            }
         }
         if(!this.native_valid_utf8(out)) { return null }
         return bytes(out).decode("utf-8")
@@ -772,9 +774,9 @@ struct(http) {
         return lines
     }
 
-    private fn(native_parse_request_line(line)) {
+    private fn(native_parse_request_line(line, max_request_line)) {
         n := line.size()
-        if(n == 0 || n > 8192) { return {"ok":false,"status":414} }
+        if(n == 0 || n > max_request_line) { return {"ok":false,"status":414} }
         sp1 := -1
         sp2 := -1
         i := 0
@@ -808,7 +810,7 @@ struct(http) {
         return {"ok":true,"method":method,"target":target,"version":version}
     }
 
-    private fn(native_parse_headers(lines, max_headers)) {
+    private fn(native_parse_headers(lines, max_headers, max_body_bytes)) {
         headers := {}
         content_lengths := []
         host_count := 0
@@ -857,7 +859,9 @@ struct(http) {
         if(content_lengths.size() > 1) { return {"ok":false,"status":400,"headers":null,"length":0} }
         length := 0
         if(content_lengths.size() == 1) {
-            if(!this.native_is_digits_str(content_lengths[0]) || content_lengths[0].length() > 20) { return {"ok":false,"status":400,"headers":null,"length":0} }
+            if(!this.native_is_digits_str(content_lengths[0])) { return {"ok":false,"status":400,"headers":null,"length":0} }
+            body_digits := max_body_bytes.to_string().length()
+            if(content_lengths[0].length() > body_digits) { return {"ok":false,"status":413,"headers":null,"length":0} }
             length = content_lengths[0].to_int()
         }
         if(headers.has("transfer-encoding")) { return {"ok":false,"status":501,"headers":null,"length":0} }
@@ -874,8 +878,8 @@ struct(http) {
             key := pair
             value := ""
             if(eq != -1) { key = pair.substr(0, eq); value = pair.substr(eq + 1) }
-            dk := this.native_percent_decode(key)
-            dv := this.native_percent_decode(value)
+            dk := this.native_unquote(key, true)
+            dv := this.native_unquote(value, true)
             if(dk == null || dv == null) { return null }
             if(query.has(dk)) {
                 existing := query[dk]
@@ -886,8 +890,9 @@ struct(http) {
         return query
     }
 
-    private fn(native_cookies_from_request(headers)) {
+    private fn(native_cookies_from_request(headers, max_cookie_pairs)) {
         cookies := {}
+        count := 0
         if(!headers.has("cookie")) { return cookies }
         for(raw : headers["cookie"]) {
             for(part : raw.split(";")) {
@@ -895,6 +900,8 @@ struct(http) {
                 if(trimmed == "") { continue }
                 eq := trimmed.index_of("=")
                 if(eq <= 0) { continue }
+                count += 1
+                if(count > max_cookie_pairs) { return cookies }
                 key := trimmed.substr(0, eq)
                 value := trimmed.substr(eq + 1)
                 if(key == "") { continue }
@@ -908,28 +915,25 @@ struct(http) {
         return cookies
     }
 
-    private fn(native_build_request(method, target, headers, body_arr, remote_addr)) {
+    private fn(native_build_request(method, target, headers, body_arr, remote_addr, config)) {
         qidx := target.index_of("?")
-        path_text := target
+        raw_path := target
         raw_query := ""
         if(qidx != -1) {
-            path_text = target.substr(0, qidx)
+            raw_path = target.substr(0, qidx)
             raw_query = target.substr(qidx + 1)
         }
-        decoded_path := this.native_percent_decode(path_text)
+        decoded_path := this.native_unquote(raw_path, false)
         if(decoded_path == null) { return null }
         query := this.native_parse_query(raw_query)
         if(query == null) { return null }
         segments := []
-        if(decoded_path != "/") {
-            inner := decoded_path.substr(1)
-            if(inner.ends_with("/")) { inner = inner.substr(0, inner.length() - 1) }
-            if(inner != "") {
-                for(part : inner.split("/")) {
-                    decoded_part := this.native_percent_decode(part)
-                    if(decoded_part == null) { return null }
-                    segments.push(decoded_part)
-                }
+        if(raw_path != "/") {
+            for(part : raw_path.split("/")) {
+                if(part == "") { continue }
+                dp := this.native_unquote(part, false)
+                if(dp == null) { return null }
+                segments.push(dp)
             }
         }
         body := {"kind":"text","text":""}
@@ -937,6 +941,7 @@ struct(http) {
             if(this.native_valid_utf8(body_arr)) { body = {"kind":"text","text":bytes(body_arr).decode("utf-8")} }
             else { body = {"kind":"bytes","size":body_arr.size(),"data":bytes(body_arr)} }
         }
+        max_cookie_pairs := this.native_config(config, "max_cookie_pairs", 128)
         request := {
             "protocol":1,
             "request_id":"native",
@@ -949,7 +954,7 @@ struct(http) {
             "body":body,
             "json":null,
             "form":{},
-            "cookies":this.native_cookies_from_request(headers),
+            "cookies":this.native_cookies_from_request(headers, max_cookie_pairs),
             "remote_addr":remote_addr
         }
         return request
@@ -1031,12 +1036,13 @@ struct(http) {
     }
 
     private fn(native_emit_header(out, header_name, value)) {
-        if(value.contains("\r") || value.contains("\n")) { return null }
+        if(header_name.contains("\r") || header_name.contains("\n") || value.contains("\r") || value.contains("\n")) { return null }
         out = this.native_append_str_bytes(out, header_name + ": " + value + "\r\n")
         return out
     }
 
     private fn(native_cookie_header(cookie)) {
+        if(type(cookie) != "object" || !cookie.has("name") || !cookie.has("value")) { return null }
         line := cookie.name + "=" + cookie.value
         if(cookie.has("path")) { line += "; Path=" + cookie.path }
         if(cookie.has("domain")) { line += "; Domain=" + cookie.domain }
@@ -1045,6 +1051,7 @@ struct(http) {
         if(cookie.has("secure") && cookie.secure) { line += "; Secure" }
         if(cookie.has("http_only") && cookie.http_only) { line += "; HttpOnly" }
         if(cookie.has("same_site")) { line += "; SameSite=" + cookie.same_site }
+        if(line.contains("\r") || line.contains("\n")) { return null }
         return line
     }
 
@@ -1063,9 +1070,15 @@ struct(http) {
         if(type(response) == "object" && response.has("body") && type(response.body) == "object" && response.body.has("kind")) {
             kind = response.body.kind
         }
-        if(kind == "text") { body_bytes = this.native_bytes_to_array(response.body.text.encode("utf-8")) }
-        else if(kind == "json") { body_bytes = this.native_json_bytes(response.body.value) }
-        else if(kind == "bytes") { body_bytes = this.native_bytes_to_array(response.body.data) }
+        if(kind == "text" && type(response) == "object" && response.has("body") && type(response.body) == "object" && response.body.has("text")) {
+            body_bytes = this.native_bytes_to_array(response.body.text.encode("utf-8"))
+        }
+        else if(kind == "json" && type(response) == "object" && response.has("body") && type(response.body) == "object" && response.body.has("value")) {
+            body_bytes = this.native_json_bytes(response.body.value)
+        }
+        else if(kind == "bytes" && type(response) == "object" && response.has("body") && type(response.body) == "object" && response.body.has("data")) {
+            body_bytes = this.native_bytes_to_array(response.body.data)
+        }
         else {
             status = 501
             headers = {"content-type":["text/plain; charset=utf-8"]}
@@ -1091,7 +1104,10 @@ struct(http) {
         }
         if(type(response) == "object" && response.has("cookies") && type(response.cookies) == "array") {
             for(cookie : response.cookies) {
-                out = this.native_append_str_bytes(out, "Set-Cookie: " + this.native_cookie_header(cookie) + "\r\n")
+                line := this.native_cookie_header(cookie)
+                if(line != null) {
+                    out = this.native_append_str_bytes(out, "Set-Cookie: " + line + "\r\n")
+                }
             }
         }
         out = this.native_append_str_bytes(out, "\r\n")
@@ -1112,93 +1128,140 @@ struct(http) {
 
     private fn(native_service(app, conn, fd, config)) {
         state_key := fd.to_string()
-        buf := []
-        if(http_native_states.contains(state_key)) { buf = http_native_states.get(state_key)["buf"] }
         max_request_line := this.native_config(config, "max_request_line", 8192)
         max_header_bytes := this.native_config(config, "max_header_bytes", 32768)
         max_headers := this.native_config(config, "max_headers", 100)
         max_body_bytes := this.native_config(config, "max_body_bytes", 1048576)
+        st := {}
+        if(http_native_states.contains(state_key)) {
+            st = http_native_states.get(state_key)
+        } else {
+            http_native_states.set(state_key, {"stage":"reading","buf":[],"last":epoch()})
+            st = http_native_states.get(state_key)
+        }
+        if(st.stage == "sending") {
+            pending := st["pending"]
+            offset := st.get("offset")
+            remaining := pending.size() - offset
+            if(remaining == 0) {
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"done"}
+            }
+            chunk_count := 65536
+            if(remaining < chunk_count) { chunk_count = remaining }
+            chunk := this.native_slice(pending, offset, chunk_count)
+            sr := socket.send_all(conn, bytes(chunk))
+            if(!sr.ok) {
+                st["offset"] = offset + sr.sent
+                st["last"] = epoch()
+                http_native_states.set(state_key, st)
+                return {"action":"keep"}
+            }
+            offset += chunk_count
+            if(offset >= pending.size()) {
+                socket.close(conn)
+                http_native_states.remove(state_key)
+                return {"action":"done"}
+            }
+            st["offset"] = offset
+            st["last"] = epoch()
+            http_native_states.set(state_key, st)
+            return {"action":"keep"}
+        }
+        buf := st["buf"]
         rr := socket.recv(conn, 65536)
         if(rr.eof) {
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
+        }
+        if(!rr.ok && !rr.would_block) {
+            socket.close(conn)
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
         if(rr.ok) {
             for(b : this.native_bytes_to_array(rr.data)) { buf.push(b) }
+            st["last"] = epoch()
+            http_native_states.set(state_key, st)
         }
         term := this.native_find(buf, 0, [13,10,13,10])
         if(term == -1) {
-            if(buf.size() > max_request_line + max_header_bytes) {
+            if(buf.size() > max_header_bytes) {
                 socket.send_all(conn, bytes(this.native_error_bytes(431, "request header fields too large")))
                 socket.close(conn)
                 http_native_states.remove(state_key)
-                return {"action":"closed"}
+                return {"action":"close"}
             }
-            http_native_states.set(state_key, {"buf":buf})
-            return {"action":"wait"}
+            st["buf"] = buf
+            http_native_states.set(state_key, st)
+            return {"action":"keep"}
         }
         header_arr := this.native_slice(buf, 0, term)
         if(header_arr.size() > max_request_line + max_header_bytes) {
             socket.send_all(conn, bytes(this.native_error_bytes(431, "request header fields too large")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
         lines := this.native_split_crlf(header_arr)
         if(lines.size() == 0) {
             socket.send_all(conn, bytes(this.native_error_bytes(400, "bad request")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
-        rl := this.native_parse_request_line(lines[0])
+        rl := this.native_parse_request_line(lines[0], max_request_line)
         if(!rl.ok) {
             socket.send_all(conn, bytes(this.native_error_bytes(rl.status, "bad request")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
-        hp := this.native_parse_headers(lines, max_headers)
+        hp := this.native_parse_headers(lines, max_headers, max_body_bytes)
         if(!hp.ok) {
             socket.send_all(conn, bytes(this.native_error_bytes(hp.status, "bad request")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
         if(hp.length > max_body_bytes) {
             socket.send_all(conn, bytes(this.native_error_bytes(413, "request body is too large")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
         body_start := term + 4
         have_body := buf.size() - body_start
         if(have_body < hp.length) {
-            if(buf.size() - (term + 4) > max_body_bytes) {
-                socket.send_all(conn, bytes(this.native_error_bytes(413, "request body is too large")))
-                socket.close(conn)
-                http_native_states.remove(state_key)
-                return {"action":"closed"}
-            }
-            http_native_states.set(state_key, {"buf":buf})
-            return {"action":"wait"}
+            st["buf"] = buf
+            http_native_states.set(state_key, st)
+            return {"action":"keep"}
         }
         body_arr := this.native_slice(buf, body_start, hp.length)
-        request := this.native_build_request(rl.method, rl.target, hp.headers, body_arr, "native")
+        request := this.native_build_request(rl.method, rl.target, hp.headers, body_arr, "native", config)
         if(request == null) {
             socket.send_all(conn, bytes(this.native_error_bytes(400, "bad request")))
             socket.close(conn)
-            if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-            return {"action":"closed"}
+            http_native_states.remove(state_key)
+            return {"action":"close"}
         }
-        response := this.dispatch(app, request)
-        if(type(response) == "string") { response = this.text(response) }
-        out := this.native_serialize_response(request, response)
-        socket.send_all(conn, bytes(out))
-        socket.close(conn)
-        if(http_native_states.contains(state_key)) { http_native_states.remove(state_key) }
-        return {"action":"served"}
+        response := {"status":500,"headers":{},"body":{"kind":"text","text":"handler error"}}
+        try {
+            response = this.dispatch(app, request)
+            if(type(response) == "string") { response = this.text(response) }
+        } catch(e) {
+            response = {"status":500,"headers":{},"body":{"kind":"text","text":"handler error"}}
+        }
+        out := []
+        try {
+            out = this.native_serialize_response(request, response)
+        } catch(e) {
+            out = this.native_error_bytes(500, "response serialization failed")
+        }
+        http_native_states.set(state_key, {"stage":"sending","pending":out,"offset":0,"last":epoch()})
+        return {"action":"keep"}
     }
 
     private fn(native_listen(app)) {
@@ -1207,6 +1270,9 @@ struct(http) {
         port := this.native_config(config, "port", 0)
         backlog := this.native_config(config, "backlog", 16)
         max_requests := this.native_config(config, "max_requests", 0)
+        client_timeout := this.native_config(config, "client_timeout_ms", 10000)
+        max_concurrency := this.native_config(config, "max_concurrency", 16)
+        if(os() == "windows" && max_concurrency > 63) { max_concurrency = 63 }
         listener := socket.listen({"host":host,"port":port,"backlog":backlog})
         if(!listener.ok) {
             return {"ok":false,"error":listener.error,"error_code":listener.error_code,"backend":"native","exit_code":1}
@@ -1219,37 +1285,78 @@ struct(http) {
             poll_items.push(listener.handle)
             for(a : active) { poll_items.push(a.handle) }
             pr := socket.poll(poll_items, 50)
-            if(!pr.ok) { break }
+            if(!pr.ok) {
+                for(a : active) { socket.close(a.handle) }
+                socket.close(listener.handle)
+                return {"ok":false,"error":pr.error,"error_code":"socket_error","backend":"native","exit_code":1}
+            }
+            res_by_fd := {}
+            i := 1
+            while(i < pr.results.size()) {
+                res := pr.results[i]
+                res_key := res.handle.fd.to_string()
+                res_by_fd[res_key] = res
+                i += 1
+            }
+            fresh := {}
             r0 := pr.results[0]
             if(r0.readable || r0.error || r0.hangup) {
                 if(max_requests == 0 || served < max_requests) {
-                    ac := socket.accept(listener.handle)
-                    while(ac.ok) {
-                        active.push({"handle":ac.conn,"fd":ac.conn.fd})
-                        ac = socket.accept(listener.handle)
+                    if(active.size() < max_concurrency) {
+                        ac := socket.accept(listener.handle)
+                        while(ac.ok && active.size() < max_concurrency) {
+                            active.push({"handle":ac.conn,"fd":ac.conn.fd})
+                            fresh_key := ac.conn.fd.to_string()
+                            fresh[fresh_key] = true
+                            ac = socket.accept(listener.handle)
+                        }
                     }
                 }
             }
             next_active := []
             for(a : active) {
-                handle := a.handle
                 fd := a.fd
-                result := {"action":"wait"}
-                if(max_requests == 0 || served < max_requests) {
-                    result = this.native_service(app, handle, fd, config)
-                }
-                if(result.action == "served") {
-                    served += 1
-                    if(max_requests > 0 && served >= max_requests) { done = true }
-                }
-                if(result.action == "wait") {
-                    next_active.push(a)
+                key := fd.to_string()
+                res := {"readable":false,"writable":false,"error":false,"hangup":false}
+                if(res_by_fd.has(key)) { res = res_by_fd[key] }
+                stg := "reading"
+                if(http_native_states.contains(key)) { stg = http_native_states.get(key).stage }
+                ready := false
+                if(stg == "sending") { ready = res.writable || res.error || res.hangup }
+                else { ready = res.readable || res.error || res.hangup || fresh.has(key) }
+                if(ready) {
+                    result := this.native_service(app, a.handle, fd, config)
+                    if(result.action == "done") {
+                        served += 1
+                        if(max_requests > 0 && served >= max_requests) { done = true }
+                    }
+                    if(result.action == "keep") {
+                        next_active.push({"handle":a.handle,"fd":fd})
+                    }
+                } else {
+                    state_key := fd.to_string()
+                    if(http_native_states.contains(state_key)) {
+                        st := http_native_states.get(state_key)
+                        age := epoch() - st.get("last")
+                        if(age > client_timeout) {
+                            if(st.stage == "reading") {
+                                socket.send_all(a.handle, bytes(this.native_error_bytes(408, "request timeout")))
+                            }
+                            socket.close(a.handle)
+                            http_native_states.remove(state_key)
+                        } else {
+                            next_active.push({"handle":a.handle,"fd":fd})
+                        }
+                    } else {
+                        next_active.push({"handle":a.handle,"fd":fd})
+                    }
                 }
             }
             active = next_active
         }
         for(a : active) { socket.close(a.handle) }
         socket.close(listener.handle)
+        http_native_states.clear()
         return {"ok":true,"error":"","error_code":"","backend":"native","exit_code":0}
     }
 }
